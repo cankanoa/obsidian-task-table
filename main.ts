@@ -1,5 +1,6 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 
+import { TaskTableView } from "./views/TaskTableView";
 // Remember to rename these classes and interfaces!
 
 interface MyPluginSettings {
@@ -10,16 +11,22 @@ const DEFAULT_SETTINGS: MyPluginSettings = {
 	mySetting: 'default'
 }
 
+export const TASK_TABLE_VIEW_TYPE = "task-table-view";
+
 export default class MyPlugin extends Plugin {
 	settings: MyPluginSettings;
 
 	async onload() {
 		await this.loadSettings();
 
+		this.registerView(
+			TASK_TABLE_VIEW_TYPE,
+			(leaf) => new TaskTableView(leaf)
+		);
+
 		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		const ribbonIconEl = this.addRibbonIcon('dice', 'Open Task Table', async () => {
+			await this.activateView();
 		});
 		// Perform additional things with the ribbon
 		ribbonIconEl.addClass('my-plugin-ribbon-class');
@@ -88,6 +95,24 @@ export default class MyPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async activateView() {
+		const { workspace } = this.app;
+
+		// Try to find an existing leaf with the view
+		const existingLeaf = workspace.getLeavesOfType(TASK_TABLE_VIEW_TYPE)[0];
+		if (existingLeaf) {
+			workspace.revealLeaf(existingLeaf);
+			return;
+		}
+
+		// Otherwise, create a new one
+		const leaf = workspace.getLeaf("tab");
+		await leaf.setViewState({
+			type: TASK_TABLE_VIEW_TYPE,
+			active: true,
+		});
 	}
 }
 

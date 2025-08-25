@@ -9,18 +9,24 @@ import {
 } from "obsidian";
 import { TASK_TABLE_VIEW_TYPE } from "../main";
 
-type TaskEntry = { file: TFile; lineIndex: number; originalLine: string };
+type TaskEntry = {
+  file: TFile;
+  lineIndex: number;
+  originalLine: string;
+  depth: number;
+  rootKey: string; // unique per root task (file:path + line index of root)
+};
 
 type RowRef = {
   filePath: string;
   lineIndex: number;
   checkbox: HTMLInputElement;
-  textCell: HTMLTableCellElement;
+  textCell: HTMLDivElement;
   originalLine: string;
 };
 
 type GroupBucket = {
-  name: string;          // folder name before the Planner folder (or "(root)")
+  name: string;
   items: TaskEntry[];
 };
 
@@ -68,11 +74,27 @@ function getIndentDepth(line: string): number {
   return 1 + Math.floor(spaces / 2);
 }
 
+/** Distinct hues via golden angle for stable, varied colors. */
+function hueByIndex(idx: number): number {
+  const GOLDEN_ANGLE = 137.508;
+  return (idx * GOLDEN_ANGLE) % 360;
+}
+function hsl(h: number, s: number, l: number) {
+  return `hsl(${Math.round(h)} ${Math.round(s)}% ${Math.round(l)}%)`;
+}
+
 export class TaskTableView extends ItemView {
   private table!: HTMLTableElement;
   private tbody!: HTMLTableSectionElement;
   private rowRefs: RowRef[] = [];
   private tasksByFile = new Map<string, TaskEntry[]>();
+  private rootHueByKey = new Map<string, number>(); // rootKey -> hue
+
+  // color tuning
+  private SAT = 78;            // saturation for “fully colored” root
+  private L_BASE = 42;         // root lightness
+  private L_STEP = 20;         // +20 per indent level
+  private L_MAX = 90;          // cap
 
   constructor(leaf: WorkspaceLeaf) { super(leaf); }
   getViewType() { return TASK_TABLE_VIEW_TYPE; }
@@ -83,7 +105,6 @@ export class TaskTableView extends ItemView {
       (this.containerEl.querySelector(".view-content") as HTMLElement) ??
       this.containerEl;
     container.empty();
-    container.createEl("h2", { text: "Editable Tasks from Planner Folders" });
 
     const controls = container.createDiv({ cls: "task-table-controls" });
     const scanBtn = controls.createEl("button", { text: "Scan Tasks" });
@@ -102,26 +123,11 @@ export class TaskTableView extends ItemView {
     scroller.style.maxHeight = "520px";
     scroller.style.overflow = "auto";
 
-    // Build single table
+    // Single table, NO HEADER ROW
     this.table = scroller.createEl("table");
     this.table.style.width = "100%";
     this.table.style.borderCollapse = "collapse";
     this.table.style.fontFamily = "var(--font-interface)";
-
-    const thead = this.table.createEl("thead");
-    const trh = thead.createEl("tr");
-    // First header is intentionally blank (Order+Done live there)
-    const headers = ["", "Task", "" /* actions */];
-    headers.forEach((h) => {
-      const th = trh.createEl("th", { text: h });
-      th.style.position = "sticky";
-      th.style.top = "0";
-      th.style.background = "var(--background-primary)";
-      th.style.padding = "6px 8px";
-      th.style.borderBottom = "1px solid var(--background-modifier-border)";
-      th.style.textAlign = h === "Task" ? "left" : "center";
-      th.style.whiteSpace = "nowrap";
-    });
 
     this.tbody = this.table.createEl("tbody");
 
@@ -131,6 +137,7 @@ export class TaskTableView extends ItemView {
   async onClose() {
     this.rowRefs = [];
     this.tasksByFile.clear();
+    this.rootHueByKey.clear();
   }
 
   // ---------- render helpers ----------
@@ -143,60 +150,75 @@ export class TaskTableView extends ItemView {
   private addGroupSubheader(name: string) {
     const tr = this.tbody.createEl("tr");
     const td = tr.createEl("td", { text: name });
-    td.colSpan = 3;
+    td.colSpan = 2;
     td.style.padding = "6px 8px";
     td.style.fontWeight = "600";
     td.style.background = "var(--background-secondary)";
     td.style.borderBottom = "1px solid var(--background-modifier-border)";
   }
 
-  private addTaskRow(file: TFile, lineIndex: number, originalLine: string) {
+  private addTaskRow(entry: TaskEntry) {
+    const { file, lineIndex, originalLine, depth, rootKey } = entry;
     const m = originalLine.match(/^\s*([-*])\s\[( |x|X)\]\s(.+)$/);
     if (!m) return;
 
-    const depth = getIndentDepth(originalLine);
     const checked = m[2].toLowerCase() === "x";
     const text = m[3];
 
     const tr = this.tbody.createEl("tr");
 
-    // Col 1: depth number + checkbox (header for this col is blank)
-    const tdOrder = tr.createEl("td");
-    tdOrder.style.padding = "6px 8px";
-    tdOrder.style.whiteSpace = "nowrap";
-    tdOrder.style.borderBottom = "1px solid var(--background-modifier-border)";
-    tdOrder.style.textAlign = "center";
+    // Left cell: number + checkbox + editable text
+    const tdLeft = tr.createEl("td");
+    tdLeft.style.padding = "6px 8px";
+    tdLeft.style.borderBottom = "1px solid var(--background-modifier-border)";
+    tdLeft.style.verticalAlign = "middle";
+    tdLeft.style.width = "100%";
 
-    const depthSpan = tdOrder.createSpan({ text: String(depth) });
-    depthSpan.style.display = "inline-block";
+    const leftWrap = tdLeft.createDiv();
+    leftWrap.style.display = "flex";
+    leftWrap.style.alignItems = "center";
+    leftWrap.style.gap = "8px";
+    leftWrap.style.minWidth = "0";
+
+    const depthSpan = leftWrap.createSpan({ text: String(depth) });
+    depthSpan.style.flex = "0 0 auto";
     depthSpan.style.minWidth = "1.25em";
-    depthSpan.style.marginRight = "6px";
 
-    const cb = tdOrder.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+    // COLOR: root hue + per-indent lightness
+    const hue = this.rootHueByKey.get(rootKey) ?? 0;
+    const light = Math.min(this.L_MAX, this.L_BASE + (depth - 1) * this.L_STEP);
+    depthSpan.style.color = hsl(hue, this.SAT, light);
+
+    const cb = leftWrap.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
     cb.checked = checked;
+    cb.style.flex = "0 0 auto";
     cb.style.verticalAlign = "middle";
 
-    // Col 2: Task (editable)
-    const tdTask = tr.createEl("td");
-    tdTask.style.padding = "6px 8px";
-    tdTask.style.borderBottom = "1px solid var(--background-modifier-border)";
-    tdTask.style.wordBreak = "break-word";
-    tdTask.contentEditable = "true";
-    tdTask.spellcheck = false;
-    tdTask.textContent = text;
+    const editable = leftWrap.createDiv();
+    editable.style.flex = "1 1 auto";
+    editable.style.minWidth = "0";
+    editable.style.wordBreak = "break-word";
+    editable.style.whiteSpace = "pre-wrap";
+    editable.contentEditable = "true";
+    editable.spellcheck = false;
+    editable.textContent = text;
 
-    // Col 3: Actions
-    const tdAction = tr.createEl("td");
-    tdAction.style.padding = "6px 8px";
-    tdAction.style.textAlign = "center";
-    tdAction.style.whiteSpace = "nowrap";
-    tdAction.style.borderBottom = "1px solid var(--background-modifier-border)";
+    // Right cell: action icon on the far right
+    const tdRight = tr.createEl("td");
+    tdRight.style.padding = "6px 8px";
+    tdRight.style.borderBottom = "1px solid var(--background-modifier-border)";
+    tdRight.style.textAlign = "right";
+    tdRight.style.whiteSpace = "nowrap";
+    tdRight.style.verticalAlign = "middle";
 
-    const openBtn = tdAction.createEl("button", { text: "Open" });
+    const openBtn = tdRight.createEl("button", { title: "Open" });
+    openBtn.textContent = "↗";
+    openBtn.style.fontSize = "14px";
+    openBtn.style.lineHeight = "1";
+    openBtn.style.padding = "4px 8px";
     openBtn.onclick = async () => {
       const leaf = this.app.workspace.getLeaf(true);
       await leaf.openFile(file);
-      // try to place cursor on the line (best effort)
       const anyApp = this.app as any;
       const mdView = anyApp.workspace?.getActiveFileView?.();
       const editor = mdView?.editor ?? null;
@@ -207,7 +229,7 @@ export class TaskTableView extends ItemView {
       filePath: file.path,
       lineIndex,
       checkbox: cb,
-      textCell: tdTask,
+      textCell: editable,
       originalLine,
     });
   }
@@ -215,7 +237,6 @@ export class TaskTableView extends ItemView {
   // ---------- IO ----------
 
   private buildLine(originalLine: string, checked: boolean, text: string): string {
-    // Preserve original indent + bullet; replace checkbox/text
     const m = originalLine.match(/^(\s*[-*]\s)\[( |x|X)\]\s(.+)$/);
     if (m) return `${m[1]}[${checked ? "x" : " "}] ${text}`;
     return `- [${checked ? "x" : " "}] ${text}`;
@@ -229,26 +250,52 @@ export class TaskTableView extends ItemView {
       return;
     }
 
-    const files = this.app.vault.getMarkdownFiles().filter((f: TFile) => isInAnyPlanner(f, planners));
+    const files = this.app.vault
+      .getMarkdownFiles()
+      .filter((f: TFile) => isInAnyPlanner(f, planners));
+
     const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
 
-    // Build groups first (keyed by path prefix), then render into one table
+    // Build groups + compute root relationships + assign hues
     const groups = new Map<string, GroupBucket>();
     this.tasksByFile.clear();
+    this.rootHueByKey.clear();
+
+    let rootIndexCounter = 0;
 
     for (const file of files) {
       const content = await this.app.vault.read(file);
       const lines = content.split("\n");
       const fileTasks: TaskEntry[] = [];
 
+      // Track most recent root for depth=1
+      let currentRootKey = "";
+      // Optional stack to reset when a new root appears (robust to jumps in depth)
+      let lastSeenDepth1Key = "";
+
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         if (!taskRegex.test(line)) continue;
 
+        const depth = getIndentDepth(line);
+
+        if (depth === 1) {
+          currentRootKey = `${file.path}::${i}`; // unique root id
+          lastSeenDepth1Key = currentRootKey;
+
+          // assign hue if first time we see this root
+          if (!this.rootHueByKey.has(currentRootKey)) {
+            this.rootHueByKey.set(currentRootKey, hueByIndex(rootIndexCounter++));
+          }
+        } else {
+          // inherit from latest root in this file (best effort)
+          if (!currentRootKey) currentRootKey = lastSeenDepth1Key || `${file.path}::first`;
+        }
+
         const { key, name } = getGroupFromPath(file.path);
         if (!groups.has(key)) groups.set(key, { name, items: [] });
 
-        const entry = { file, lineIndex: i, originalLine: line };
+        const entry: TaskEntry = { file, lineIndex: i, originalLine: line, depth, rootKey: currentRootKey };
         groups.get(key)!.items.push(entry);
         fileTasks.push(entry);
       }
@@ -260,9 +307,7 @@ export class TaskTableView extends ItemView {
     this.clearTableBody();
     for (const [, bucket] of groups) {
       this.addGroupSubheader(bucket.name);
-      for (const entry of bucket.items) {
-        this.addTaskRow(entry.file, entry.lineIndex, entry.originalLine);
-      }
+      for (const entry of bucket.items) this.addTaskRow(entry);
     }
 
     const count = Array.from(this.tasksByFile.values()).reduce((n, a) => n + a.length, 0);

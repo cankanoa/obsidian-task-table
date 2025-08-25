@@ -14,12 +14,20 @@ type TaskEntry = {
   lineIndex: number;
   originalLine: string;
   depth: number;
-  rootKey: string; // unique per root task (file:path + line index of root)
+  rootKey: string;
+  id: string;        // unique (filePath::lineIndex)
+  parentId?: string; // nearest shallower task in same group
 };
 
 type RowRef = {
+  id: string;
+  parentId?: string;
+  depth: number;
+  hasChildren: boolean;
   filePath: string;
   lineIndex: number;
+  tr: HTMLTableRowElement;
+  numEl: HTMLSpanElement;        // the number element (toggle/indicator)
   checkbox: HTMLInputElement;
   textCell: HTMLDivElement;
   originalLine: string;
@@ -33,10 +41,7 @@ type GroupBucket = {
 function findPlannerFolders(app: App): TFolder[] {
   const planners: TFolder[] = [];
   for (const f of app.vault.getAllLoadedFiles()) {
-    if (
-      f instanceof TFolder &&
-      f.path.split("/").some((s: string) => /planner/i.test(s))
-    ) {
+    if (f instanceof TFolder && f.path.split("/").some((s) => /planner/i.test(s))) {
       planners.push(f);
     }
   }
@@ -45,14 +50,10 @@ function findPlannerFolders(app: App): TFolder[] {
 
 function isInAnyPlanner(file: TFile, planners: TFolder[]) {
   return planners.some(
-    (p: TFolder) => file.path === p.path || file.path.startsWith(p.path + "/"),
+    (p) => file.path === p.path || file.path.startsWith(p.path + "/"),
   );
 }
 
-/** Grouping:
- * key  = full path prefix up to (exclusive) the segment matching /planner/i
- * name = folder immediately before that segment (or "(root)" if none)
- */
 function getGroupFromPath(path: string): { key: string; name: string } {
   const parts = path.split("/");
   const idx = parts.findIndex((seg) => /planner/i.test(seg));
@@ -74,7 +75,7 @@ function getIndentDepth(line: string): number {
   return 1 + Math.floor(spaces / 2);
 }
 
-/** Distinct hues via golden angle for stable, varied colors. */
+/** Distinct hues via golden angle for varied root colors. */
 function hueByIndex(idx: number): number {
   const GOLDEN_ANGLE = 137.508;
   return (idx * GOLDEN_ANGLE) % 360;
@@ -90,11 +91,16 @@ export class TaskTableView extends ItemView {
   private tasksByFile = new Map<string, TaskEntry[]>();
   private rootHueByKey = new Map<string, number>(); // rootKey -> hue
 
+  // collapse state & fast lookups
+  private collapsed = new Set<string>();              // ids that are collapsed
+  private childrenById = new Map<string, string[]>(); // id -> direct children ids
+  private rowById = new Map<string, RowRef>();        // id -> rowRef
+
   // color tuning
-  private SAT = 78;            // saturation for “fully colored” root
-  private L_BASE = 42;         // root lightness
-  private L_STEP = 20;         // +20 per indent level
-  private L_MAX = 90;          // cap
+  private SAT = 78;
+  private L_BASE = 42;
+  private L_STEP = 20;
+  private L_MAX = 90;
 
   constructor(leaf: WorkspaceLeaf) { super(leaf); }
   getViewType() { return TASK_TABLE_VIEW_TYPE; }
@@ -123,7 +129,6 @@ export class TaskTableView extends ItemView {
     scroller.style.maxHeight = "520px";
     scroller.style.overflow = "auto";
 
-    // Single table, NO HEADER ROW
     this.table = scroller.createEl("table");
     this.table.style.width = "100%";
     this.table.style.borderCollapse = "collapse";
@@ -138,6 +143,9 @@ export class TaskTableView extends ItemView {
     this.rowRefs = [];
     this.tasksByFile.clear();
     this.rootHueByKey.clear();
+    this.collapsed.clear();
+    this.childrenById.clear();
+    this.rowById.clear();
   }
 
   // ---------- render helpers ----------
@@ -145,6 +153,7 @@ export class TaskTableView extends ItemView {
   private clearTableBody() {
     this.rowRefs = [];
     this.tbody.empty();
+    // keep maps; they are rebuilt in scanTasks()
   }
 
   private addGroupSubheader(name: string) {
@@ -157,8 +166,51 @@ export class TaskTableView extends ItemView {
     td.style.borderBottom = "1px solid var(--background-modifier-border)";
   }
 
-  private addTaskRow(entry: TaskEntry) {
-    const { file, lineIndex, originalLine, depth, rootKey } = entry;
+  private styleAndWireNumber(row: RowRef) {
+  const { numEl, hasChildren, id, depth } = row;
+
+  // Square box so rotation is centered & stable
+  numEl.style.display = "inline-flex";
+  numEl.style.alignItems = "center";
+  numEl.style.justifyContent = "center";
+  numEl.style.width = "1.5em";
+  numEl.style.height = "1.5em";
+  numEl.style.minWidth = "1.5em";
+  numEl.style.flex = "0 0 auto";
+  numEl.style.borderRadius = "4px"; // optional, looks nicer
+  numEl.style.fontVariantNumeric = "tabular-nums";
+
+  // Smooth rotation on center
+  numEl.style.transition = "transform 120ms ease-out";
+  numEl.style.transformOrigin = "50% 50%";
+
+  // Weight: bolder if it has children; slightly lighter if not
+  numEl.style.fontWeight = hasChildren ? "800" : "600";
+  numEl.style.cursor = hasChildren ? "pointer" : "default";
+
+  // Color (root hue + depth lightness)
+  const rk = (this.rowById.get(id) as any)?.rootKey;
+  const hue = this.rootHueByKey.get(rk) ?? 0;
+  const light = Math.min(this.L_MAX, this.L_BASE + (depth - 1) * this.L_STEP);
+  numEl.style.color = hsl(hue, this.SAT, light);
+
+  // Toggle wiring
+  if (hasChildren) {
+    numEl.title = "Show/hide sub-tasks";
+	numEl.style.fontWeight = "900";
+    numEl.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this.toggleNode(id); };
+    // Collapsed = rotate -90deg (left), Expanded = 0deg
+    numEl.style.transform = this.collapsed.has(id) ? "rotate(-90deg)" : "rotate(0deg)";
+  } else {
+  	numEl.style.fontWeight = "100";
+    numEl.removeAttribute("title");
+    numEl.onclick = null as any;
+    numEl.style.transform = "none";
+  }
+}
+
+  private addTaskRow(entry: TaskEntry, hasChildren: boolean) {
+    const { file, lineIndex, originalLine, depth, rootKey, id, parentId } = entry;
     const m = originalLine.match(/^\s*([-*])\s\[( |x|X)\]\s(.+)$/);
     if (!m) return;
 
@@ -167,7 +219,7 @@ export class TaskTableView extends ItemView {
 
     const tr = this.tbody.createEl("tr");
 
-    // Left cell: number + checkbox + editable text
+    // Left cell: number (toggle) + checkbox + editable text
     const tdLeft = tr.createEl("td");
     tdLeft.style.padding = "6px 8px";
     tdLeft.style.borderBottom = "1px solid var(--background-modifier-border)";
@@ -180,14 +232,8 @@ export class TaskTableView extends ItemView {
     leftWrap.style.gap = "8px";
     leftWrap.style.minWidth = "0";
 
-    const depthSpan = leftWrap.createSpan({ text: String(depth) });
-    depthSpan.style.flex = "0 0 auto";
-    depthSpan.style.minWidth = "1.25em";
-
-    // COLOR: root hue + per-indent lightness
-    const hue = this.rootHueByKey.get(rootKey) ?? 0;
-    const light = Math.min(this.L_MAX, this.L_BASE + (depth - 1) * this.L_STEP);
-    depthSpan.style.color = hsl(hue, this.SAT, light);
+	const numEl = leftWrap.createSpan({ text: String(depth) });
+	leftWrap.style.gap = "6px";
 
     const cb = leftWrap.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
     cb.checked = checked;
@@ -203,7 +249,7 @@ export class TaskTableView extends ItemView {
     editable.spellcheck = false;
     editable.textContent = text;
 
-    // Right cell: action icon on the far right
+    // Right cell: open icon
     const tdRight = tr.createEl("td");
     tdRight.style.padding = "6px 8px";
     tdRight.style.borderBottom = "1px solid var(--background-modifier-border)";
@@ -225,13 +271,80 @@ export class TaskTableView extends ItemView {
       if (editor?.setCursor) editor.setCursor({ line: lineIndex, ch: 0 });
     };
 
-    this.rowRefs.push({
+    const rowRef: RowRef = {
+      id,
+      parentId,
+      depth,
+      hasChildren,
       filePath: file.path,
       lineIndex,
+      tr,
+      numEl,
       checkbox: cb,
       textCell: editable,
       originalLine,
-    });
+    } as any;
+    // @ts-expect-error stash rootKey via map lookup later
+    (rowRef as any).rootKey = rootKey;
+
+    this.rowRefs.push(rowRef);
+    this.rowById.set(id, rowRef);
+
+    // finalize number style/handlers
+    this.styleAndWireNumber(rowRef);
+  }
+
+  // ---------- collapsing logic ----------
+
+  private toggleNode(id: string) {
+    const isCollapsed = this.collapsed.has(id);
+    if (isCollapsed) this.expand(id);
+    else this.collapse(id);
+  }
+
+  private collapse(id: string) {
+    this.collapsed.add(id);
+    const row = this.rowById.get(id);
+    if (row) this.styleAndWireNumber(row);
+    // hide all descendants
+    for (const childId of this.getDescendants(id)) {
+      const childRow = this.rowById.get(childId);
+      if (childRow) childRow.tr.style.display = "none";
+    }
+  }
+
+  private expand(id: string) {
+    this.collapsed.delete(id);
+    const row = this.rowById.get(id);
+    if (row) this.styleAndWireNumber(row);
+    // show descendants that don't have a collapsed ancestor
+    for (const childId of this.getDescendants(id)) {
+      if (!this.hasCollapsedAncestor(childId)) {
+        const childRow = this.rowById.get(childId);
+        if (childRow) childRow.tr.style.display = "";
+      }
+    }
+  }
+
+  private hasCollapsedAncestor(id: string): boolean {
+    let current = this.rowById.get(id);
+    while (current?.parentId) {
+      if (this.collapsed.has(current.parentId)) return true;
+      current = this.rowById.get(current.parentId);
+    }
+    return false;
+  }
+
+  private getDescendants(id: string): string[] {
+    const out: string[] = [];
+    const stack = [...(this.childrenById.get(id) || [])];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      out.push(cur);
+      const kids = this.childrenById.get(cur);
+      if (kids && kids.length) stack.push(...kids);
+    }
+    return out;
   }
 
   // ---------- IO ----------
@@ -256,11 +369,13 @@ export class TaskTableView extends ItemView {
 
     const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
 
-    // Build groups + compute root relationships + assign hues
-    const groups = new Map<string, GroupBucket>();
+    // rebuild all maps
     this.tasksByFile.clear();
     this.rootHueByKey.clear();
+    this.childrenById.clear();
+    this.rowById.clear();
 
+    const groups = new Map<string, GroupBucket>();
     let rootIndexCounter = 0;
 
     for (const file of files) {
@@ -268,36 +383,53 @@ export class TaskTableView extends ItemView {
       const lines = content.split("\n");
       const fileTasks: TaskEntry[] = [];
 
-      // Track most recent root for depth=1
       let currentRootKey = "";
-      // Optional stack to reset when a new root appears (robust to jumps in depth)
       let lastSeenDepth1Key = "";
 
+      // First pass: collect entries with depth and rootKey
+      const rawEntries: TaskEntry[] = [];
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         if (!taskRegex.test(line)) continue;
 
         const depth = getIndentDepth(line);
+        const id = `${file.path}::${i}`;
 
         if (depth === 1) {
-          currentRootKey = `${file.path}::${i}`; // unique root id
+          currentRootKey = `${file.path}::${i}`;
           lastSeenDepth1Key = currentRootKey;
-
-          // assign hue if first time we see this root
           if (!this.rootHueByKey.has(currentRootKey)) {
             this.rootHueByKey.set(currentRootKey, hueByIndex(rootIndexCounter++));
           }
-        } else {
-          // inherit from latest root in this file (best effort)
-          if (!currentRootKey) currentRootKey = lastSeenDepth1Key || `${file.path}::first`;
+        } else if (!currentRootKey) {
+          currentRootKey = lastSeenDepth1Key || `${file.path}::first`;
         }
 
+        rawEntries.push({
+          file, lineIndex: i, originalLine: line, depth, rootKey: currentRootKey, id,
+        });
+      }
+
+      // Second pass: assign parentId using a depth stack
+      const stack: TaskEntry[] = [];
+      for (const e of rawEntries) {
+        while (stack.length && stack[stack.length - 1].depth >= e.depth) {
+          stack.pop();
+        }
+        e.parentId = stack.length ? stack[stack.length - 1].id : undefined;
+        stack.push(e);
+      }
+
+      // Build children map and group
+      for (const e of rawEntries) {
+        if (e.parentId) {
+          if (!this.childrenById.has(e.parentId)) this.childrenById.set(e.parentId, []);
+          this.childrenById.get(e.parentId)!.push(e.id);
+        }
         const { key, name } = getGroupFromPath(file.path);
         if (!groups.has(key)) groups.set(key, { name, items: [] });
-
-        const entry: TaskEntry = { file, lineIndex: i, originalLine: line, depth, rootKey: currentRootKey };
-        groups.get(key)!.items.push(entry);
-        fileTasks.push(entry);
+        groups.get(key)!.items.push(e);
+        fileTasks.push(e);
       }
 
       if (fileTasks.length) this.tasksByFile.set(file.path, fileTasks);
@@ -307,7 +439,16 @@ export class TaskTableView extends ItemView {
     this.clearTableBody();
     for (const [, bucket] of groups) {
       this.addGroupSubheader(bucket.name);
-      for (const entry of bucket.items) this.addTaskRow(entry);
+      for (const e of bucket.items) {
+        const hasChildren = !!(this.childrenById.get(e.id)?.length);
+        this.addTaskRow(e, hasChildren);
+      }
+    }
+
+    // Apply collapsed state & indicator rotation
+    for (const row of this.rowRefs) {
+      if (this.hasCollapsedAncestor(row.id)) row.tr.style.display = "none";
+      this.styleAndWireNumber(row);
     }
 
     const count = Array.from(this.tasksByFile.values()).reduce((n, a) => n + a.length, 0);

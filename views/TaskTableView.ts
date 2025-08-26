@@ -6,6 +6,8 @@ import {
   TFile,
   TFolder,
   WorkspaceLeaf,
+  MarkdownRenderer,
+  Component,
 } from "obsidian";
 import { TASK_TABLE_VIEW_TYPE } from "../main";
 
@@ -30,10 +32,13 @@ type RowRef = {
   tr: HTMLTableRowElement;
   numEl: HTMLSpanElement;      // number (also drag handle)
   checkbox: HTMLInputElement;
-  textCell: HTMLDivElement;
+  textCell: HTMLDivElement;    // plain-text editor (contentEditable)
+  previewCell: HTMLDivElement; // rendered markdown
+  mdComp: Component;           // per-row component for postprocessors
   originalLine: string;
   rootToken: string;           // for color
   groupKey: string;            // for group collapse
+  renderTimer?: number;        // debounce handle
 };
 
 type FileBucket = { filePath: string; fileName: string; items: TaskEntry[] };
@@ -155,9 +160,8 @@ export class TaskTableView extends ItemView {
     this.statusIcon.style.height = "18px";
     this.statusIcon.style.fontSize = "14px";
     this.statusIcon.style.opacity = "0.9";
-
-    this.updateStatusIcon(); // start as saved ✓
-	this.statusIcon.style.background = "transparent";
+    this.statusIcon.style.background = "transparent";
+    this.updateStatusIcon();
 
     // scroller/table
     this.scroller = container.createDiv();
@@ -171,6 +175,25 @@ export class TaskTableView extends ItemView {
     this.tbody = this.table.createEl("tbody");
 
     await this.scanTasks();
+
+	const ttStyle = document.createElement("style");
+	ttStyle.textContent = `
+	/* scoped markdown tightening */
+	.tt-md { padding: 0 !important; }
+	.tt-md p,
+	.tt-md ul,
+	.tt-md ol,
+	.tt-md blockquote,
+	.tt-md h1, .tt-md h2, .tt-md h3, .tt-md h4, .tt-md h5, .tt-md h6,
+	.tt-md .callout,
+	.tt-md .internal-embed,
+	.tt-md .media-embed {
+	  margin: 0 !important;
+	}
+	.tt-md ul, .tt-md ol { padding-inline-start: 1.1em; }
+	`;
+	document.head.appendChild(ttStyle);
+	this.disposers.push(() => ttStyle.remove());
 
     // auto-scan: vault changes that touch Planner files, but skip while we are saving
     const vault = this.app.vault;
@@ -203,6 +226,8 @@ export class TaskTableView extends ItemView {
   }
 
   async onClose() {
+    // unload per-row components
+    for (const r of this.rowRefs) r.mdComp?.unload?.();
     this.rowRefs = [];
     this.tasksByFile.clear();
     this.childrenById.clear();
@@ -224,21 +249,20 @@ export class TaskTableView extends ItemView {
   }
 
   private updateStatusIcon() {
-  this.statusIcon.style.display = "inline-block";
-  this.statusIcon.style.lineHeight = "1";
-  this.statusIcon.style.margin = "0";
-  this.statusIcon.style.padding = "0";
-
-  if (this.savingDepth > 0 || this.dirty) {
-    this.statusIcon.style.fontSize = "26px";
-    this.statusIcon.textContent = "⟳";
-    this.statusIcon.title = this.savingDepth > 0 ? "Saving…" : "Unsaved edits…";
-  } else {
-	this.statusIcon.style.fontSize = "18px";
-    this.statusIcon.textContent = "✓";
-    this.statusIcon.title = "Saved";
+    this.statusIcon.style.display = "inline-block";
+    this.statusIcon.style.lineHeight = "1";
+    this.statusIcon.style.margin = "0";
+    this.statusIcon.style.padding = "0";
+    if (this.savingDepth > 0 || this.dirty) {
+      this.statusIcon.style.fontSize = "26px";
+      this.statusIcon.textContent = "⟳";
+      this.statusIcon.title = this.savingDepth > 0 ? "Saving…" : "Unsaved edits…";
+    } else {
+      this.statusIcon.style.fontSize = "18px";
+      this.statusIcon.textContent = "✓";
+      this.statusIcon.title = "Saved";
+    }
   }
-}
   private setSaving(on: boolean) {
     this.savingDepth = Math.max(0, this.savingDepth + (on ? 1 : -1));
     this.updateStatusIcon();
@@ -261,6 +285,8 @@ export class TaskTableView extends ItemView {
   }
 
   private clearTableBody() {
+    // unload markdown components to clean postprocessors
+    for (const r of this.rowRefs) r.mdComp?.unload?.();
     this.rowRefs = [];
     this.tbody.empty();
     this.groupHeaderRow.clear();
@@ -546,14 +572,29 @@ export class TaskTableView extends ItemView {
     cb.style.flex = "0 0 auto";
     cb.style.verticalAlign = "middle";
 
-    const editable = leftWrap.createDiv();
-    editable.style.flex = "1 1 auto";
-    editable.style.minWidth = "0";
-    editable.style.wordBreak = "break-word";
+    // EDITOR (contentEditable) + PREVIEW (MarkdownRenderer)
+    const textWrap = leftWrap.createDiv();
+    textWrap.style.flex = "1 1 auto";
+    textWrap.style.minWidth = "0";
+    textWrap.style.position = "relative";
+    textWrap.style.wordBreak = "break-word";
+
+    const editable = textWrap.createDiv();
+    editable.style.display = "none";                // default to preview mode
     editable.style.whiteSpace = "pre-wrap";
+    editable.style.outline = "none";
+    editable.style.minWidth = "0";
     editable.contentEditable = "true";
     editable.spellcheck = false;
     editable.textContent = text;
+
+	const preview = textWrap.createDiv();
+	preview.addClass("markdown-preview-view");
+	preview.addClass("tt-md");             // <- scoped class to strip margins
+	preview.style.minWidth = "0";
+	preview.style.cursor = "text";
+	preview.style.padding = "0";           // extra safety
+	preview.style.lineHeight = "1.25";     // optional: a bit tighter
 
     const tdRight = tr.createEl("td");
     tdRight.style.padding = "6px 8px";
@@ -585,6 +626,10 @@ export class TaskTableView extends ItemView {
     delBtn.style.padding = "4px 8px";
     delBtn.style.marginLeft = "6px";
 
+    // per-row component for markdown postprocessors
+    const mdComp = new Component();
+    this.addChild(mdComp);
+
     const rowRef: RowRef = {
       id,
       parentId,
@@ -596,16 +641,42 @@ export class TaskTableView extends ItemView {
       numEl,
       checkbox: cb,
       textCell: editable,
+      previewCell: preview,
+      mdComp,
       originalLine,
       rootToken,
       groupKey,
     };
 
-    // AUTOSAVE & STATUS:
-    // mark dirty on input; debounce batch save; preserve caret by NOT rescanning on save
+    // initial render
+    this.renderMarkdown(rowRef);
+
+    // toggle: preview -> edit on click
+    preview.addEventListener("click", () => {
+      preview.hide();
+      editable.show();
+      // place caret at end
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editable);
+      range.collapse(false);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+      editable.focus();
+    });
+
+    // edit handlers
     editable.addEventListener("input", () => {
       this.markDirty();
+      // live re-render (debounced) while typing but keep editor visible
+      this.debounceRender(rowRef, 200);
       this.scheduleAutosave();
+    });
+    editable.addEventListener("blur", () => {
+      // back to preview mode after editing
+      preview.show();
+      editable.hide();
+      this.renderMarkdown(rowRef);
     });
 
     // quick save on checkbox change (no re-render)
@@ -618,9 +689,7 @@ export class TaskTableView extends ItemView {
         checkbox: cb,
         text: editable.textContent ?? "",
       });
-      // update in-memory "originalLine" so subsequent saves diff correctly
       rowRef.originalLine = this.buildLine(rowRef.originalLine, cb.checked, editable.textContent ?? "");
-      // don't force clean here; batch saver may still be pending for other edits
     };
 
     delBtn.onclick = async () => {
@@ -646,6 +715,20 @@ export class TaskTableView extends ItemView {
     this.rowRefs.push(rowRef);
     this.rowById.set(id, rowRef);
     this.styleAndWireNumber(rowRef);
+  }
+
+  // Render markdown for a row using Obsidian's renderer
+  private async renderMarkdown(row: RowRef) {
+    const markdown = (row.textCell.textContent ?? "").trim();
+    row.previewCell.empty();
+    // Obsidian's renderer handles links/embeds/callouts/etc.
+    await MarkdownRenderer.render(this.app, markdown, row.previewCell, row.filePath, row.mdComp);
+  }
+
+  // Debounced live re-render during typing (keeps editor visible)
+  private debounceRender(row: RowRef, wait = 200) {
+    if (row.renderTimer) window.clearTimeout(row.renderTimer);
+    row.renderTimer = window.setTimeout(() => this.renderMarkdown(row), wait);
   }
 
   // ---------- node collapsing ----------
@@ -948,6 +1031,8 @@ export class TaskTableView extends ItemView {
       for (const ref of this.rowRefs) {
         const text = (ref.textCell.textContent ?? "").trim();
         ref.originalLine = this.buildLine(ref.originalLine, ref.checkbox.checked, text);
+        // refresh preview to reflect save if in preview mode
+        if (ref.previewCell.isShown()) this.renderMarkdown(ref);
       }
       this.markCleanIfVersion(versionAtStart);
     } catch (e) {

@@ -17,8 +17,8 @@ type TaskEntry = {
   originalLine: string;
   depth: number;
   rootKey: string;
-  rootToken: string;       // color key (stable per session)
-  id: string;              // filePath::lineIndex
+  rootToken: string; // color key (stable per session)
+  id: string; // filePath::lineIndex
   parentId?: string;
 };
 
@@ -30,15 +30,16 @@ type RowRef = {
   filePath: string;
   lineIndex: number;
   tr: HTMLTableRowElement;
-  numEl: HTMLSpanElement;      // number (also drag handle)
+  numEl: HTMLSpanElement; // number (also drag handle)
   checkbox: HTMLInputElement;
-  textCell: HTMLDivElement;    // plain-text editor (contentEditable)
+  textCell: HTMLDivElement; // plain-text editor (contentEditable)
   previewCell: HTMLDivElement; // rendered markdown
-  mdComp: Component;           // per-row component for postprocessors
+  mdComp: Component; // per-row component for postprocessors
   originalLine: string;
-  rootToken: string;           // for color
-  groupKey: string;            // for group collapse
-  renderTimer?: number;        // debounce handle
+  rootToken: string; // for color
+  groupKey: string; // for group collapse
+  renderTimer?: number; // debounce handle
+  leftWrap: HTMLDivElement; // align control container
 };
 
 type FileBucket = { filePath: string; fileName: string; items: TaskEntry[] };
@@ -79,24 +80,29 @@ function getIndentDepth(line: string): number {
   const spaces = (m[1] ?? "").replace(/\t/g, "  ").length;
   return 1 + Math.floor(spaces / 2);
 }
-function hsl(h: number, s: number, l: number) { return `hsl(${Math.round(h)} ${Math.round(s)}% ${Math.round(l)}%)`; }
+function hsl(h: number, s: number, l: number) {
+  return `hsl(${Math.round(h)} ${Math.round(s)}% ${Math.round(l)}%)`;
+}
 
 export class TaskTableView extends ItemView {
   private table!: HTMLTableElement;
   private tbody!: HTMLTableSectionElement;
   private scroller!: HTMLDivElement;
 
-  // save status UI
-  private statusWrap!: HTMLDivElement;
+  // top status bar
+  private statusBar!: HTMLDivElement;
   private statusIcon!: HTMLSpanElement;
 
   // state for status
-  private savingDepth = 0;     // >0 while writing
-  private dirty = false;       // true when local edits not yet saved
-  private editsVersion = 0;    // bump on input; used to reconcile dirty after save
+  private savingDepth = 0; // >0 while writing
+  private dirty = false; // true when local edits not yet saved
+  private editsVersion = 0; // bump on input; used to reconcile dirty after save
 
   // suppress re-scan during our own writes to preserve focus
   private squelchScanDepth = 0;
+
+  // suppress chevron animation during mass style updates (prevents re-triggering)
+  private silentStylePass = false;
 
   private rowRefs: RowRef[] = [];
   private tasksByFile = new Map<string, TaskEntry[]>();
@@ -105,10 +111,13 @@ export class TaskTableView extends ItemView {
   private collapsed = new Set<string>();
 
   // collapsible headers
-  private collapsedGroups = new Set<string>();  // groupKey
-  private collapsedFiles = new Set<string>();   // filePath
+  private collapsedGroups = new Set<string>(); // groupKey
+  private collapsedFiles = new Set<string>(); // filePath
   private groupHeaderRow = new Map<string, HTMLTableRowElement>();
   private fileHeaderRow = new Map<string, HTMLTableRowElement>();
+
+  // placeholder rows for each file
+  private newRowByFile = new Map<string, HTMLTableRowElement>();
 
   // drag state
   private draggingId: string | null = null;
@@ -130,9 +139,18 @@ export class TaskTableView extends ItemView {
   private scheduleRescan = this.debounce(() => this.scanTasks(), 300);
   private scheduleAutosave = this.debounce(() => this.saveEdits(), 600);
 
-  constructor(leaf: WorkspaceLeaf) { super(leaf); }
-  getViewType() { return TASK_TABLE_VIEW_TYPE; }
-  getDisplayText() { return "Task Table"; }
+  // after creating a new item, focus it
+  private pendingFocusId: string | null = null;
+
+  constructor(leaf: WorkspaceLeaf) {
+    super(leaf);
+  }
+  getViewType() {
+    return TASK_TABLE_VIEW_TYPE;
+  }
+  getDisplayText() {
+    return "Task Table";
+  }
 
   async onOpen() {
     const container =
@@ -143,15 +161,18 @@ export class TaskTableView extends ItemView {
     container.style.flexDirection = "column";
     container.style.height = "100%";
     container.style.padding = "0";
-    container.style.position = "relative";
 
-    // status icon (top-right)
-    this.statusWrap = container.createDiv();
-    this.statusWrap.style.position = "absolute";
-    this.statusWrap.style.top = "6px";
-    this.statusWrap.style.right = "8px";
-    this.statusWrap.style.zIndex = "2";
-    this.statusIcon = this.statusWrap.createSpan();
+    // Top status bar
+    this.statusBar = container.createDiv();
+    this.statusBar.style.flex = "0 0 auto";
+    this.statusBar.style.display = "flex";
+    this.statusBar.style.alignItems = "center";
+    this.statusBar.style.justifyContent = "flex-end";
+    this.statusBar.style.height = "28px";
+    this.statusBar.style.padding = "0 12px 0 8px"; // slight right margin so it's not glued to edge
+    this.statusBar.style.borderBottom = "1px solid var(--background-modifier-border)";
+
+    this.statusIcon = this.statusBar.createSpan();
     this.statusIcon.setAttr("aria-label", "save status");
     this.statusIcon.style.display = "inline-flex";
     this.statusIcon.style.alignItems = "center";
@@ -161,6 +182,7 @@ export class TaskTableView extends ItemView {
     this.statusIcon.style.fontSize = "14px";
     this.statusIcon.style.opacity = "0.9";
     this.statusIcon.style.background = "transparent";
+    this.statusIcon.style.marginRight = "6px";
     this.updateStatusIcon();
 
     // scroller/table
@@ -174,26 +196,42 @@ export class TaskTableView extends ItemView {
     this.table.style.fontFamily = "var(--font-interface)";
     this.tbody = this.table.createEl("tbody");
 
-    await this.scanTasks();
+    const ttStyle = document.createElement("style");
+    ttStyle.textContent = `
+/* markdown tightening */
+.tt-md { padding: 0 !important; }
+.tt-md p,
+.tt-md ul,
+.tt-md ol,
+.tt-md blockquote,
+.tt-md h1, .tt-md h2, .tt-md h3, .tt-md h4, .tt-md h5, .tt-md h6,
+.tt-md .callout,
+.tt-md .internal-embed,
+.tt-md .media-embed { margin: 0 !important; }
+.tt-md ul, .tt-md ol { padding-inline-start: 1.1em; }
 
-	const ttStyle = document.createElement("style");
-	ttStyle.textContent = `
-	/* scoped markdown tightening */
-	.tt-md { padding: 0 !important; }
-	.tt-md p,
-	.tt-md ul,
-	.tt-md ol,
-	.tt-md blockquote,
-	.tt-md h1, .tt-md h2, .tt-md h3, .tt-md h4, .tt-md h5, .tt-md h6,
-	.tt-md .callout,
-	.tt-md .internal-embed,
-	.tt-md .media-embed {
-	  margin: 0 !important;
-	}
-	.tt-md ul, .tt-md ol { padding-inline-start: 1.1em; }
-	`;
-	document.head.appendChild(ttStyle);
-	this.disposers.push(() => ttStyle.remove());
+/* row baseline to prevent drag hover border shifting layout */
+.task-row { border-top: 2px solid transparent; border-bottom: 2px solid transparent; }
+.task-row.hover-top { border-top-color: var(--text-accent); }
+.task-row.hover-bottom { border-bottom-color: var(--text-accent); }
+
+/* placeholder new-row styling */
+.task-new .placeholder { color: var(--text-muted); }
+
+/* keep controls pinned to top on multiline, but center on single-line */
+.row-wrap { display:flex; align-items:center; gap:6px; min-width:0; }
+.task-row.multiline .row-wrap { align-items:flex-start; }
+
+/* cells */
+.task-cell { vertical-align: top; }
+
+/* consistent font in edit vs preview */
+.task-edit, .task-preview { font-size: var(--font-ui-medium, 14px); line-height: 1.4; }
+`;
+    document.head.appendChild(ttStyle);
+    this.disposers.push(() => ttStyle.remove());
+
+    await this.scanTasks();
 
     // auto-scan: vault changes that touch Planner files, but skip while we are saving
     const vault = this.app.vault;
@@ -234,13 +272,17 @@ export class TaskTableView extends ItemView {
     this.rowById.clear();
     this.draggingId = null;
     this.hoverTarget = null;
-    for (const d of this.disposers) { try { d(); } catch {} }
+    for (const d of this.disposers) {
+      try {
+        d();
+      } catch {}
+    }
     this.disposers = [];
   }
 
   // ---------- helpers ----------
 
-  private debounce<T extends (...a:any[])=>any>(fn:T, wait:number) {
+  private debounce<T extends (...a: any[]) => any>(fn: T, wait: number) {
     let t: number | undefined;
     return (...args: Parameters<T>) => {
       if (t) window.clearTimeout(t);
@@ -254,7 +296,7 @@ export class TaskTableView extends ItemView {
     this.statusIcon.style.margin = "0";
     this.statusIcon.style.padding = "0";
     if (this.savingDepth > 0 || this.dirty) {
-      this.statusIcon.style.fontSize = "26px";
+      this.statusIcon.style.fontSize = "22px";
       this.statusIcon.textContent = "⟳";
       this.statusIcon.title = this.savingDepth > 0 ? "Saving…" : "Unsaved edits…";
     } else {
@@ -280,8 +322,11 @@ export class TaskTableView extends ItemView {
   }
   private async withSquelch<T>(fn: () => Promise<T>): Promise<T> {
     this.squelchScanDepth++;
-    try { return await fn(); }
-    finally { this.squelchScanDepth = Math.max(0, this.squelchScanDepth - 1); }
+    try {
+      return await fn();
+    } finally {
+      this.squelchScanDepth = Math.max(0, this.squelchScanDepth - 1);
+    }
   }
 
   private clearTableBody() {
@@ -291,6 +336,7 @@ export class TaskTableView extends ItemView {
     this.tbody.empty();
     this.groupHeaderRow.clear();
     this.fileHeaderRow.clear();
+    this.newRowByFile.clear();
   }
 
   private makeChevronButton(expanded: boolean): HTMLButtonElement {
@@ -333,6 +379,7 @@ export class TaskTableView extends ItemView {
     const tr = this.tbody.createEl("tr");
     const td = tr.createEl("td");
     td.colSpan = 2;
+    td.classList.add("task-cell");
     td.style.padding = "8px 8px";
     td.style.fontWeight = "700";
     td.style.fontSize = "1.05rem";
@@ -360,11 +407,16 @@ export class TaskTableView extends ItemView {
       for (const fb of bucket.files) {
         const ftr = this.fileHeaderRow.get(fb.filePath);
         if (ftr) ftr.style.display = this.collapsedGroups.has(bucket.key) ? "none" : "";
+        // hide/show placeholder rows inside group
+        const newTr = this.newRowByFile.get(fb.filePath);
+        if (newTr) newTr.style.display = this.collapsedGroups.has(bucket.key) ? "none" : "";
         for (const r of this.rowRefs) {
           if (r.groupKey === bucket.key) {
             r.tr.style.display = this.collapsedGroups.has(bucket.key)
               ? "none"
-              : (this.collapsedFiles.has(r.filePath) || this.hasCollapsedAncestor(r.id)) ? "none" : "";
+              : this.collapsedFiles.has(r.filePath) || this.hasCollapsedAncestor(r.id)
+              ? "none"
+              : "";
           }
         }
       }
@@ -379,8 +431,9 @@ export class TaskTableView extends ItemView {
     const tr = this.tbody.createEl("tr");
     const td = tr.createEl("td");
     td.colSpan = 2;
+    td.classList.add("task-cell");
     td.style.padding = "6px 8px";
-    td.style.fontWeight = "600";
+    td.style.fontWeight = "500"; // slightly less bold
     td.style.fontSize = "1rem";
     td.style.background = "transparent";
     td.style.borderBottom = "1px solid var(--background-modifier-border)";
@@ -389,7 +442,8 @@ export class TaskTableView extends ItemView {
     wrap.style.display = "flex";
     wrap.style.alignItems = "center";
 
-    const expanded = !this.collapsedFiles.has(fileBucket.filePath) && !this.collapsedGroups.has(groupKey);
+    const expanded =
+      !this.collapsedFiles.has(fileBucket.filePath) && !this.collapsedGroups.has(groupKey);
     const chev = this.makeChevronButton(expanded);
     wrap.appendChild(chev);
 
@@ -406,9 +460,20 @@ export class TaskTableView extends ItemView {
       for (const r of this.rowRefs) {
         if (r.filePath === fileBucket.filePath) {
           r.tr.style.display =
-            this.collapsedGroups.has(groupKey) || this.collapsedFiles.has(fileBucket.filePath) || this.hasCollapsedAncestor(r.id)
-              ? "none" : "";
+            this.collapsedGroups.has(groupKey) ||
+            this.collapsedFiles.has(fileBucket.filePath) ||
+            this.hasCollapsedAncestor(r.id)
+              ? "none"
+              : "";
         }
+      }
+      // toggle placeholder for this file
+      const newTr = this.newRowByFile.get(fileBucket.filePath);
+      if (newTr) {
+        newTr.style.display =
+          this.collapsedGroups.has(groupKey) || this.collapsedFiles.has(fileBucket.filePath)
+            ? "none"
+            : "";
       }
     };
     chev.onclick = toggle;
@@ -430,10 +495,10 @@ export class TaskTableView extends ItemView {
     numEl.style.flex = "0 0 auto";
     numEl.style.borderRadius = "4px";
     numEl.style.fontVariantNumeric = "tabular-nums";
-    numEl.style.transition = "transform 120ms ease-out";
     numEl.style.transformOrigin = "50% 50%";
     numEl.style.fontWeight = hasChildren ? "900" : "100";
     numEl.style.cursor = "grab";
+    numEl.style.transition = this.silentStylePass ? "none" : "transform 120ms ease-out";
 
     const hue = this.hueByRootToken.get(rootToken) ?? 0;
     const light = Math.min(this.L_MAX, this.L_BASE + (depth - 1) * this.L_STEP);
@@ -469,7 +534,11 @@ export class TaskTableView extends ItemView {
 
     numEl.onclick = (e) => {
       if ((e as any).detail === 0) return;
-      if (hasChildren) { e.preventDefault(); e.stopPropagation(); this.toggleNode(id); }
+      if (hasChildren) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.toggleNode(id);
+      }
     };
 
     row.tr.addEventListener("dragover", (e) => this.onRowDragOver(e, row));
@@ -480,11 +549,13 @@ export class TaskTableView extends ItemView {
   private clearHoverStyles() {
     if (!this.hoverTarget) return;
     const targetRow = this.rowById.get(this.hoverTarget.id);
-    if (!targetRow) { this.hoverTarget = null; return; }
+    if (!targetRow) {
+      this.hoverTarget = null;
+      return;
+    }
+    targetRow.tr.classList.remove("hover-top", "hover-bottom");
     targetRow.tr.style.outline = "";
     targetRow.tr.style.outlineOffset = "";
-    targetRow.tr.style.borderTop = "";
-    targetRow.tr.style.borderBottom = "";
     this.hoverTarget = null;
   }
   private onRowDragOver(e: DragEvent, target: RowRef) {
@@ -501,12 +572,12 @@ export class TaskTableView extends ItemView {
       this.clearHoverStyles();
       this.hoverTarget = { id: target.id, mode };
       if (mode === "on") {
-        target.tr.style.outline = "2px solid var(--text-accent)";
+        target.tr.style.outline = "2px solid var(--text-accent)"; // outline doesn't affect layout
         target.tr.style.outlineOffset = "-2px";
       } else if (mode === "before") {
-        target.tr.style.borderTop = "2px solid var(--text-accent)";
+        target.tr.classList.add("hover-top");
       } else {
-        target.tr.style.borderBottom = "2px solid var(--text-accent)";
+        target.tr.classList.add("hover-bottom");
       }
     }
   }
@@ -552,25 +623,23 @@ export class TaskTableView extends ItemView {
     const text = m[3];
 
     const tr = this.tbody.createEl("tr");
+    tr.classList.add("task-row");
 
     const tdLeft = tr.createEl("td");
+    tdLeft.classList.add("task-cell");
     tdLeft.style.padding = "6px 8px";
     tdLeft.style.borderBottom = "1px solid var(--background-modifier-border)";
-    tdLeft.style.verticalAlign = "middle";
+    tdLeft.style.verticalAlign = "top";
     tdLeft.style.width = "100%";
 
     const leftWrap = tdLeft.createDiv();
-    leftWrap.style.display = "flex";
-    leftWrap.style.alignItems = "center";
-    leftWrap.style.gap = "6px";
-    leftWrap.style.minWidth = "0";
+    leftWrap.addClass("row-wrap"); // alignment controlled via .multiline class on row
 
     const numEl = leftWrap.createSpan({ text: String(depth) });
 
     const cb = leftWrap.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
     cb.checked = checked;
     cb.style.flex = "0 0 auto";
-    cb.style.verticalAlign = "middle";
 
     // EDITOR (contentEditable) + PREVIEW (MarkdownRenderer)
     const textWrap = leftWrap.createDiv();
@@ -580,7 +649,8 @@ export class TaskTableView extends ItemView {
     textWrap.style.wordBreak = "break-word";
 
     const editable = textWrap.createDiv();
-    editable.style.display = "none";                // default to preview mode
+    editable.addClass("task-edit");
+    editable.style.display = "none"; // preview-first
     editable.style.whiteSpace = "pre-wrap";
     editable.style.outline = "none";
     editable.style.minWidth = "0";
@@ -588,20 +658,19 @@ export class TaskTableView extends ItemView {
     editable.spellcheck = false;
     editable.textContent = text;
 
-	const preview = textWrap.createDiv();
-	preview.addClass("markdown-preview-view");
-	preview.addClass("tt-md");             // <- scoped class to strip margins
-	preview.style.minWidth = "0";
-	preview.style.cursor = "text";
-	preview.style.padding = "0";           // extra safety
-	preview.style.lineHeight = "1.25";     // optional: a bit tighter
+    const preview = textWrap.createDiv();
+    preview.addClass("markdown-preview-view", "tt-md", "task-preview");
+    preview.style.minWidth = "0";
+    preview.style.cursor = "text";
+    preview.style.padding = "0";
 
     const tdRight = tr.createEl("td");
+    tdRight.classList.add("task-cell");
     tdRight.style.padding = "6px 8px";
     tdRight.style.borderBottom = "1px solid var(--background-modifier-border)";
     tdRight.style.textAlign = "right";
     tdRight.style.whiteSpace = "nowrap";
-    tdRight.style.verticalAlign = "middle";
+    tdRight.style.verticalAlign = "top";
 
     // open
     const openBtn = tdRight.createEl("button", { title: "Open" });
@@ -646,10 +715,11 @@ export class TaskTableView extends ItemView {
       originalLine,
       rootToken,
       groupKey,
+      leftWrap,
     };
 
-    // initial render
-    this.renderMarkdown(rowRef);
+    // initial render + layout
+    this.renderMarkdown(rowRef).then(() => this.updateRowLayout(rowRef, text));
 
     // toggle: preview -> edit on click
     preview.addEventListener("click", () => {
@@ -668,12 +738,12 @@ export class TaskTableView extends ItemView {
     // edit handlers
     editable.addEventListener("input", () => {
       this.markDirty();
+      this.updateRowLayout(rowRef, editable.textContent ?? "");
       // live re-render (debounced) while typing but keep editor visible
       this.debounceRender(rowRef, 200);
       this.scheduleAutosave();
     });
     editable.addEventListener("blur", () => {
-      // back to preview mode after editing
       preview.show();
       editable.hide();
       this.renderMarkdown(rowRef);
@@ -689,14 +759,20 @@ export class TaskTableView extends ItemView {
         checkbox: cb,
         text: editable.textContent ?? "",
       });
-      rowRef.originalLine = this.buildLine(rowRef.originalLine, cb.checked, editable.textContent ?? "");
+      rowRef.originalLine = this.buildLine(
+        rowRef.originalLine,
+        cb.checked,
+        editable.textContent ?? ""
+      );
     };
 
     delBtn.onclick = async () => {
       try {
         this.setSaving(true);
         const st = this.scroller?.scrollTop ?? 0;
-        await this.withSquelch(async () => { await this.deleteSubtree(rowRef); });
+        await this.withSquelch(async () => {
+          await this.deleteSubtree(rowRef);
+        });
         await this.scanTasks(); // delete requires re-render
         if (this.scroller) this.scroller.scrollTop = st;
         new Notice("Task deleted.");
@@ -717,11 +793,17 @@ export class TaskTableView extends ItemView {
     this.styleAndWireNumber(rowRef);
   }
 
+  // Keep single-line centered; multiline pinned to top
+  private updateRowLayout(row: RowRef, text: string) {
+    const isMulti = /\n/.test(text || "") || (row.previewCell?.innerText || "").includes("\n");
+    if (isMulti) row.tr.classList.add("multiline");
+    else row.tr.classList.remove("multiline");
+  }
+
   // Render markdown for a row using Obsidian's renderer
   private async renderMarkdown(row: RowRef) {
     const markdown = (row.textCell.textContent ?? "").trim();
     row.previewCell.empty();
-    // Obsidian's renderer handles links/embeds/callouts/etc.
     await MarkdownRenderer.render(this.app, markdown, row.previewCell, row.filePath, row.mdComp);
   }
 
@@ -795,13 +877,14 @@ export class TaskTableView extends ItemView {
     return `${indent}- [${checked ? "x" : " "}] ${text}`;
   }
   private getPreviousRowInFile(ref: RowRef): RowRef | null {
-    const idx = this.rowRefs.findIndex(r => r.id === ref.id);
+    const idx = this.rowRefs.findIndex((r) => r.id === ref.id);
     for (let i = idx - 1; i >= 0; i--) if (this.rowRefs[i].filePath === ref.filePath) return this.rowRefs[i];
     return null;
   }
   private getNextRowInFile(ref: RowRef): RowRef | null {
-    const idx = this.rowRefs.findIndex(r => r.id === ref.id);
-    for (let i = idx + 1; i < this.rowRefs.length; i++) if (this.rowRefs[i].filePath === ref.filePath) return this.rowRefs[i];
+    const idx = this.rowRefs.findIndex((r) => r.id === ref.id);
+    for (let i = idx + 1; i < this.rowRefs.length; i++)
+      if (this.rowRefs[i].filePath === ref.filePath) return this.rowRefs[i];
     return null;
   }
 
@@ -821,7 +904,12 @@ export class TaskTableView extends ItemView {
     await this.relocateSubtree(source, destFilePath, insertAt, newDepth);
   }
 
-  private async relocateSubtree(source: RowRef, destFilePath: string, insertAt: number, newDepth: number) {
+  private async relocateSubtree(
+    source: RowRef,
+    destFilePath: string,
+    insertAt: number,
+    newDepth: number
+  ) {
     const srcFile = this.app.vault.getAbstractFileByPath(source.filePath) as TFile;
     const destFile = this.app.vault.getAbstractFileByPath(destFilePath) as TFile;
 
@@ -835,7 +923,9 @@ export class TaskTableView extends ItemView {
     let end = start;
     for (let i = start + 1; i < srcLines.length; i++) {
       const ln = srcLines[i];
-      if (!taskRegex.test(ln)) { break; }
+      if (!taskRegex.test(ln)) {
+        break;
+      }
       const d = getIndentDepth(ln);
       if (d <= srcDepth) break;
       end = i;
@@ -882,12 +972,15 @@ export class TaskTableView extends ItemView {
       return;
     }
 
-    const files = this.app.vault.getMarkdownFiles().filter((f: TFile) => isInAnyPlanner(f, planners));
+    const files = this.app.vault
+      .getMarkdownFiles()
+      .filter((f: TFile) => isInAnyPlanner(f, planners));
     const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
 
     this.tasksByFile.clear();
     this.childrenById.clear();
     this.rowById.clear();
+    this.newRowByFile.clear();
 
     const groupsMap = new Map<string, { name: string; files: Map<string, FileBucket> }>();
 
@@ -925,7 +1018,15 @@ export class TaskTableView extends ItemView {
           if (!currentRootToken) currentRootToken = lastSeenRootToken || "untitled-root";
         }
 
-        rawEntries.push({ file, lineIndex: i, originalLine: line, depth, rootKey: currentRootKey, rootToken: currentRootToken, id });
+        rawEntries.push({
+          file,
+          lineIndex: i,
+          originalLine: line,
+          depth,
+          rootKey: currentRootKey,
+          rootToken: currentRootToken,
+          id,
+        });
       }
 
       // parentId via stack
@@ -940,7 +1041,7 @@ export class TaskTableView extends ItemView {
       for (const e of rawEntries) {
         if (e.parentId) {
           if (!this.childrenById.has(e.parentId)) this.childrenById.set(e.parentId, []);
-          this.childrenById.get(e.parentId)!.push(e.id);
+        this.childrenById.get(e.parentId)!.push(e.id);
         }
         fileTasks.push(e);
       }
@@ -974,9 +1075,11 @@ export class TaskTableView extends ItemView {
       for (const fb of gb.files) {
         this.addFileSubheader(fb, gb.key);
         for (const e of fb.items) {
-          const hasChildren = !!(this.childrenById.get(e.id)?.length);
+          const hasChildren = !!this.childrenById.get(e.id)?.length;
           this.addTaskRow(e, hasChildren, gb.key);
         }
+        // always add a placeholder "New" row at end of each file
+        this.addNewPlaceholderRow(fb.filePath, gb.key);
       }
     }
 
@@ -986,13 +1089,32 @@ export class TaskTableView extends ItemView {
     padTd.colSpan = 2;
     padTd.style.padding = "12px 8px";
 
-    // apply node collapse & recolor
+    // apply node collapse & recolor, silently to avoid chevron transition re-trigger
+    this.silentStylePass = true;
     for (const row of this.rowRefs) {
       if (this.hasCollapsedAncestor(row.id)) row.tr.style.display = "none";
       if (this.collapsedGroups.has(row.groupKey) || this.collapsedFiles.has(row.filePath)) {
         row.tr.style.display = "none";
       }
       this.styleAndWireNumber(row);
+    }
+    this.silentStylePass = false;
+
+    // focus a newly created item if requested
+    if (this.pendingFocusId) {
+      const ref = this.rowById.get(this.pendingFocusId);
+      this.pendingFocusId = null;
+      if (ref) {
+        ref.previewCell.hide();
+        ref.textCell.show();
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(ref.textCell);
+        range.collapse(false);
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+        ref.textCell.focus();
+      }
     }
   }
 
@@ -1099,6 +1221,192 @@ export class TaskTableView extends ItemView {
     const blockLen = end - start + 1;
     lines.splice(start, blockLen);
     await this.app.vault.modify(srcFile, lines.join("\n"));
+  }
+
+  // ---------- Placeholder "New" row at end of each file ----------
+
+  private addNewPlaceholderRow(filePath: string, groupKey: string) {
+    const tr = this.tbody.createEl("tr");
+    tr.classList.add("task-row", "task-new");
+
+    const tdLeft = tr.createEl("td");
+    tdLeft.classList.add("task-cell");
+    tdLeft.style.padding = "6px 8px";
+    tdLeft.style.borderBottom = "1px solid var(--background-modifier-border)";
+    tdLeft.style.verticalAlign = "top";
+    tdLeft.style.width = "100%";
+
+    const leftWrap = tdLeft.createDiv();
+    leftWrap.addClass("row-wrap");
+    // create invisible number + checkbox to reserve exact space so text aligns perfectly
+    const ghostNum = leftWrap.createSpan({ text: "1" });
+    ghostNum.style.visibility = "hidden";
+    const ghostCb = leftWrap.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+    ghostCb.style.visibility = "hidden";
+
+    const textWrap = leftWrap.createDiv();
+    textWrap.style.flex = "1 1 auto";
+    textWrap.style.minWidth = "0";
+
+    const input = textWrap.createDiv({ text: "New" });
+    input.addClass("task-edit", "placeholder");
+    input.contentEditable = "true";
+    input.spellcheck = false;
+    input.style.whiteSpace = "pre-wrap";
+    input.style.outline = "none";
+
+    const tdRight = tr.createEl("td");
+    tdRight.classList.add("task-cell");
+    tdRight.style.padding = "6px 8px";
+    tdRight.style.borderBottom = "1px solid var(--background-modifier-border)";
+    tdRight.style.textAlign = "right";
+    tdRight.style.whiteSpace = "nowrap";
+    tdRight.style.verticalAlign = "top";
+    // No open/delete buttons in placeholder
+
+    // hide when group/file collapsed
+    if (this.collapsedGroups.has(groupKey) || this.collapsedFiles.has(filePath)) {
+      tr.style.display = "none";
+    }
+
+    // click to clear placeholder text
+    const clearPlaceholder = () => {
+      if (input.classList.contains("placeholder")) {
+        input.empty();
+        input.classList.remove("placeholder");
+      }
+    };
+    input.addEventListener("focus", clearPlaceholder);
+    input.addEventListener("click", clearPlaceholder);
+
+    // create on commit
+    const commitCreate = async () => {
+      const text = (input.textContent ?? "").trim();
+      if (!text) return;
+      await this.createNewTaskAtEnd(filePath, text);
+    };
+
+    // Enter commits
+    input.addEventListener("keydown", async (e: KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        await commitCreate();
+      }
+    });
+
+    // first real typing commits immediately, then we keep focus on the new item
+    input.addEventListener("input", async () => {
+      if (!input.classList.contains("placeholder")) {
+        await commitCreate();
+      }
+    });
+
+    // Drag target: highlight ABOVE placeholder (so drop inserts before it)
+    tr.addEventListener("dragover", (e) => {
+      if (!this.draggingId) return;
+      e.preventDefault();
+      this.clearHoverStyles();
+      tr.classList.add("hover-top");
+      this.hoverTarget = null; // custom drop handler
+    });
+    tr.addEventListener("dragleave", () => {
+      tr.classList.remove("hover-top");
+    });
+    tr.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      tr.classList.remove("hover-top");
+      if (!this.draggingId) return;
+      const source = this.rowById.get(this.draggingId);
+      this.draggingId = null;
+      if (!source) return;
+      const st = this.scroller?.scrollTop ?? 0;
+      try {
+        await this.withSquelch(async () => {
+          await this.moveSubtreeToFileEnd(source, filePath, 1);
+        });
+        await this.scanTasks();
+        if (this.scroller) this.scroller.scrollTop = st;
+        new Notice("Item moved.");
+      } catch (err) {
+        console.error(err);
+        new Notice("Move failed.");
+      }
+    });
+
+    this.newRowByFile.set(filePath, tr);
+  }
+
+  private async createNewTaskAtEnd(filePath: string, text: string) {
+    const file = this.app.vault.getAbstractFileByPath(filePath) as TFile;
+    if (!file) return;
+    try {
+      this.setSaving(true);
+      await this.withSquelch(async () => {
+        const content = await this.app.vault.read(file);
+        // Determine true insert index (before a trailing empty line, if any)
+        const lines = content.length ? content.split("\n") : [];
+        let insertAt = lines.length;
+        if (insertAt > 0 && lines[insertAt - 1] === "") insertAt = insertAt - 1;
+
+        const newLine = `- [ ] ${text}`;
+        lines.splice(insertAt, 0, newLine);
+        const newContent = lines.join("\n");
+        await this.app.vault.modify(file, newContent.endsWith("\n") ? newContent : newContent + "\n");
+        // focus the new item (preview -> edit) after rescan
+        this.pendingFocusId = `${filePath}::${insertAt}`;
+      });
+      await this.scanTasks();
+    } finally {
+      this.setSaving(false);
+    }
+  }
+
+  private async moveSubtreeToFileEnd(source: RowRef, destFilePath: string, newDepth: number) {
+    const srcFile = this.app.vault.getAbstractFileByPath(source.filePath) as TFile;
+    const destFile = this.app.vault.getAbstractFileByPath(destFilePath) as TFile;
+
+    // read src
+    let srcContent = await this.app.vault.read(srcFile);
+    let srcLines = srcContent.split("\n");
+
+    const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
+
+    // find source block
+    const start = source.lineIndex;
+    const srcDepth = getIndentDepth(srcLines[start] ?? source.originalLine);
+    let end = start;
+    for (let i = start + 1; i < srcLines.length; i++) {
+      const ln = srcLines[i];
+      if (!taskRegex.test(ln)) break;
+      const d = getIndentDepth(ln);
+      if (d <= srcDepth) break;
+      end = i;
+    }
+    const block = srcLines.slice(start, end + 1);
+
+    // adjust depths
+    const depthDelta = newDepth - srcDepth;
+    const adjusted = block.map((ln) => {
+      if (!taskRegex.test(ln)) return ln;
+      const d = getIndentDepth(ln);
+      const nd = Math.max(1, d + depthDelta);
+      return this.lineWithDepth(ln, nd);
+    });
+
+    // remove from src
+    await this.app.vault.modify(
+      srcFile,
+      [...srcLines.slice(0, start), ...srcLines.slice(end + 1)].join("\n")
+    );
+
+    // append just before trailing empty line (if any)
+    const destContent = await this.app.vault.read(destFile);
+    const dLines = destContent.split("\n");
+    let insertAt = dLines.length;
+    if (insertAt > 0 && dLines[insertAt - 1] === "") insertAt = insertAt - 1;
+    dLines.splice(insertAt, 0, ...adjusted);
+    const out = dLines.join("\n");
+    await this.app.vault.modify(destFile, out.endsWith("\n") ? out : out + "\n");
   }
 }
 

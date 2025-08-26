@@ -81,11 +81,23 @@ export class TaskTableView extends ItemView {
   private tbody!: HTMLTableSectionElement;
   private scroller!: HTMLDivElement;
 
+  // save status UI
+  private statusWrap!: HTMLDivElement;
+  private statusIcon!: HTMLSpanElement;
+
+  // state for status
+  private savingDepth = 0;     // >0 while writing
+  private dirty = false;       // true when local edits not yet saved
+  private editsVersion = 0;    // bump on input; used to reconcile dirty after save
+
+  // suppress re-scan during our own writes to preserve focus
+  private squelchScanDepth = 0;
+
   private rowRefs: RowRef[] = [];
   private tasksByFile = new Map<string, TaskEntry[]>();
   private childrenById = new Map<string, string[]>();
   private rowById = new Map<string, RowRef>();
-  private collapsed = new Set<string>(); // task rows collapse (per node)
+  private collapsed = new Set<string>();
 
   // collapsible headers
   private collapsedGroups = new Set<string>();  // groupKey
@@ -97,17 +109,21 @@ export class TaskTableView extends ItemView {
   private draggingId: string | null = null;
   private hoverTarget: { id: string; mode: "on" | "before" | "after" } | null = null;
 
-  // colors (stable per rootToken, randomized start)
+  // colors
   private hueByRootToken = new Map<string, number>();
   private hueOrder = 0;
   private readonly GOLDEN_ANGLE = 137.508;
   private readonly huePhase = Math.random() * 360;
 
-  // color tuning
   private SAT = 78;
   private L_BASE = 42;
   private L_STEP = 20;
   private L_MAX = 90;
+
+  // disposers & autoscan/autosave
+  private disposers: Array<() => void> = [];
+  private scheduleRescan = this.debounce(() => this.scanTasks(), 300);
+  private scheduleAutosave = this.debounce(() => this.saveEdits(), 600);
 
   constructor(leaf: WorkspaceLeaf) { super(leaf); }
   getViewType() { return TASK_TABLE_VIEW_TYPE; }
@@ -118,20 +134,32 @@ export class TaskTableView extends ItemView {
       (this.containerEl.querySelector(".view-content") as HTMLElement) ?? this.containerEl;
     container.empty();
 
-    // Fill window, no borders/radius
     container.style.display = "flex";
     container.style.flexDirection = "column";
     container.style.height = "100%";
     container.style.padding = "0";
+    container.style.position = "relative";
 
-    const controls = container.createDiv({ cls: "task-table-controls" });
-    controls.style.padding = "8px 0";
-    const scanBtn = controls.createEl("button", { text: "Scan Tasks" });
-    const saveBtn = controls.createEl("button", { text: "Save Changes" });
-    scanBtn.style.marginRight = "0.5rem";
-    scanBtn.onclick = () => this.scanTasks();
-    saveBtn.onclick = () => this.saveEdits();
+    // status icon (top-right)
+    this.statusWrap = container.createDiv();
+    this.statusWrap.style.position = "absolute";
+    this.statusWrap.style.top = "6px";
+    this.statusWrap.style.right = "8px";
+    this.statusWrap.style.zIndex = "2";
+    this.statusIcon = this.statusWrap.createSpan();
+    this.statusIcon.setAttr("aria-label", "save status");
+    this.statusIcon.style.display = "inline-flex";
+    this.statusIcon.style.alignItems = "center";
+    this.statusIcon.style.justifyContent = "center";
+    this.statusIcon.style.width = "18px";
+    this.statusIcon.style.height = "18px";
+    this.statusIcon.style.fontSize = "14px";
+    this.statusIcon.style.opacity = "0.9";
 
+    this.updateStatusIcon(); // start as saved ✓
+	this.statusIcon.style.background = "transparent";
+
+    // scroller/table
     this.scroller = container.createDiv();
     this.scroller.style.flex = "1 1 auto";
     this.scroller.style.overflow = "auto";
@@ -143,6 +171,35 @@ export class TaskTableView extends ItemView {
     this.tbody = this.table.createEl("tbody");
 
     await this.scanTasks();
+
+    // auto-scan: vault changes that touch Planner files, but skip while we are saving
+    const vault = this.app.vault;
+    const onFsChange = async (af: any) => {
+      if (this.squelchScanDepth > 0) return;
+      if (!(af instanceof TFile)) return;
+      const planners = findPlannerFolders(this.app);
+      if (isInAnyPlanner(af, planners)) this.scheduleRescan();
+    };
+    const onDelete = async (af: any) => {
+      if (this.squelchScanDepth > 0) return;
+      if (!(af instanceof TFile)) return;
+      const planners = findPlannerFolders(this.app);
+      if (isInAnyPlanner(af, planners)) this.scheduleRescan();
+    };
+
+    vault.on("modify", onFsChange);
+    vault.on("create", onFsChange);
+    vault.on("rename", onFsChange);
+    vault.on("delete", onDelete);
+
+    const onFileOpen = () => this.scheduleRescan();
+    this.app.workspace.on("file-open", onFileOpen);
+
+    this.disposers.push(() => vault.off("modify", onFsChange));
+    this.disposers.push(() => vault.off("create", onFsChange));
+    this.disposers.push(() => vault.off("rename", onFsChange));
+    this.disposers.push(() => vault.off("delete", onDelete));
+    this.disposers.push(() => this.app.workspace.off("file-open", onFileOpen));
   }
 
   async onClose() {
@@ -152,9 +209,56 @@ export class TaskTableView extends ItemView {
     this.rowById.clear();
     this.draggingId = null;
     this.hoverTarget = null;
+    for (const d of this.disposers) { try { d(); } catch {} }
+    this.disposers = [];
   }
 
   // ---------- helpers ----------
+
+  private debounce<T extends (...a:any[])=>any>(fn:T, wait:number) {
+    let t: number | undefined;
+    return (...args: Parameters<T>) => {
+      if (t) window.clearTimeout(t);
+      t = window.setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  private updateStatusIcon() {
+  this.statusIcon.style.display = "inline-block";
+  this.statusIcon.style.lineHeight = "1";
+  this.statusIcon.style.margin = "0";
+  this.statusIcon.style.padding = "0";
+
+  if (this.savingDepth > 0 || this.dirty) {
+    this.statusIcon.style.fontSize = "26px";
+    this.statusIcon.textContent = "⟳";
+    this.statusIcon.title = this.savingDepth > 0 ? "Saving…" : "Unsaved edits…";
+  } else {
+	this.statusIcon.style.fontSize = "18px";
+    this.statusIcon.textContent = "✓";
+    this.statusIcon.title = "Saved";
+  }
+}
+  private setSaving(on: boolean) {
+    this.savingDepth = Math.max(0, this.savingDepth + (on ? 1 : -1));
+    this.updateStatusIcon();
+  }
+  private markDirty() {
+    this.dirty = true;
+    this.editsVersion++;
+    this.updateStatusIcon();
+  }
+  private markCleanIfVersion(versionAtStart: number) {
+    if (this.editsVersion === versionAtStart) {
+      this.dirty = false;
+      this.updateStatusIcon();
+    }
+  }
+  private async withSquelch<T>(fn: () => Promise<T>): Promise<T> {
+    this.squelchScanDepth++;
+    try { return await fn(); }
+    finally { this.squelchScanDepth = Math.max(0, this.squelchScanDepth - 1); }
+  }
 
   private clearTableBody() {
     this.rowRefs = [];
@@ -164,7 +268,6 @@ export class TaskTableView extends ItemView {
   }
 
   private makeChevronButton(expanded: boolean): HTMLButtonElement {
-    // iOS-like chevron; no outline/focus ring
     const btn = document.createElement("button");
     btn.style.background = "transparent";
     btn.style.border = "none";
@@ -174,8 +277,8 @@ export class TaskTableView extends ItemView {
     btn.style.padding = "0 6px 0 2px";
     btn.style.cursor = "pointer";
     btn.style.lineHeight = "1";
-    btn.tabIndex = -1; // prevent focus ring
-    btn.onmousedown = (e) => e.preventDefault(); // avoid focusing
+    btn.tabIndex = -1;
+    btn.onmousedown = (e) => e.preventDefault();
 
     const svgNS = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(svgNS, "svg");
@@ -184,7 +287,7 @@ export class TaskTableView extends ItemView {
     svg.setAttribute("height", "14");
     svg.style.verticalAlign = "-1px";
     const path = document.createElementNS(svgNS, "path");
-    path.setAttribute("d", "M4 6 L8 10 L12 6"); // down chevron
+    path.setAttribute("d", "M4 6 L8 10 L12 6");
     path.setAttribute("fill", "none");
     path.setAttribute("stroke", "currentColor");
     path.setAttribute("stroke-width", "2");
@@ -197,7 +300,6 @@ export class TaskTableView extends ItemView {
     (btn as any)._setExpanded = (isOpen: boolean) => {
       svg.style.transform = isOpen ? "rotate(0deg)" : "rotate(-90deg)";
     };
-
     return btn;
   }
 
@@ -291,69 +393,63 @@ export class TaskTableView extends ItemView {
   }
 
   private styleAndWireNumber(row: RowRef) {
-  const { numEl, hasChildren, id, depth, rootToken } = row;
+    const { numEl, hasChildren, id, depth, rootToken } = row;
 
-  // number box (also drag handle)
-  numEl.style.display = "inline-flex";
-  numEl.style.alignItems = "center";
-  numEl.style.justifyContent = "center";
-  numEl.style.width = "1.5em";
-  numEl.style.height = "1.5em";
-  numEl.style.minWidth = "1.5em";
-  numEl.style.flex = "0 0 auto";
-  numEl.style.borderRadius = "4px";
-  numEl.style.fontVariantNumeric = "tabular-nums";
-  numEl.style.transition = "transform 120ms ease-out";
-  numEl.style.transformOrigin = "50% 50%";
-  numEl.style.fontWeight = hasChildren ? "900" : "100";
-  numEl.style.cursor = "grab";
-
-  // color per root
-  const hue = this.hueByRootToken.get(rootToken) ?? 0;
-  const light = Math.min(this.L_MAX, this.L_BASE + (depth - 1) * this.L_STEP);
-  numEl.style.color = hsl(hue, this.SAT, light);
-
-  // rotation to indicate open/closed
-  if (hasChildren) {
-    numEl.title = "Show/hide sub-tasks";
-    numEl.style.transform = this.collapsed.has(id) ? "rotate(-90deg)" : "rotate(0deg)";
-  } else {
-    numEl.removeAttribute("title");
-    numEl.style.transform = "none";
-  }
-
-  // DRAG on number
-  numEl.setAttribute("draggable", "true");
-  numEl.ondragstart = (e) => {
-    this.draggingId = row.id;
-    numEl.style.cursor = "grabbing";
-    e.dataTransfer?.setData("text/plain", row.id);
-    const ghost = document.createElement("div");
-    ghost.textContent = "Moving…";
-    ghost.style.padding = "2px 6px";
-    ghost.style.background = "var(--background-secondary)";
-    ghost.style.border = "1px solid var(--background-modifier-border)";
-    document.body.appendChild(ghost);
-    e.dataTransfer?.setDragImage(ghost, 10, 10);
-    setTimeout(() => ghost.remove(), 0);
-  };
-  numEl.ondragend = () => {
+    numEl.style.display = "inline-flex";
+    numEl.style.alignItems = "center";
+    numEl.style.justifyContent = "center";
+    numEl.style.width = "1.5em";
+    numEl.style.height = "1.5em";
+    numEl.style.minWidth = "1.5em";
+    numEl.style.flex = "0 0 auto";
+    numEl.style.borderRadius = "4px";
+    numEl.style.fontVariantNumeric = "tabular-nums";
+    numEl.style.transition = "transform 120ms ease-out";
+    numEl.style.transformOrigin = "50% 50%";
+    numEl.style.fontWeight = hasChildren ? "900" : "100";
     numEl.style.cursor = "grab";
-    this.draggingId = null;
-    this.clearHoverStyles();
-  };
 
-  // Click toggles collapse (if parent)
-  numEl.onclick = (e) => {
-    if ((e as any).detail === 0) return; // ignore synthetic post-drag click
-    if (hasChildren) { e.preventDefault(); e.stopPropagation(); this.toggleNode(id); }
-  };
+    const hue = this.hueByRootToken.get(rootToken) ?? 0;
+    const light = Math.min(this.L_MAX, this.L_BASE + (depth - 1) * this.L_STEP);
+    numEl.style.color = hsl(hue, this.SAT, light);
 
-  // drop targets on row
-  row.tr.addEventListener("dragover", (e) => this.onRowDragOver(e, row));
-  row.tr.addEventListener("dragleave", () => this.onRowDragLeave(row));
-  row.tr.addEventListener("drop", (e) => this.onRowDrop(e, row));
-}
+    if (hasChildren) {
+      numEl.title = "Show/hide sub-tasks";
+      numEl.style.transform = this.collapsed.has(id) ? "rotate(-90deg)" : "rotate(0deg)";
+    } else {
+      numEl.removeAttribute("title");
+      numEl.style.transform = "none";
+    }
+
+    numEl.setAttribute("draggable", "true");
+    numEl.ondragstart = (e) => {
+      this.draggingId = row.id;
+      numEl.style.cursor = "grabbing";
+      e.dataTransfer?.setData("text/plain", row.id);
+      const ghost = document.createElement("div");
+      ghost.textContent = "Moving…";
+      ghost.style.padding = "2px 6px";
+      ghost.style.background = "var(--background-secondary)";
+      ghost.style.border = "1px solid var(--background-modifier-border)";
+      document.body.appendChild(ghost);
+      e.dataTransfer?.setDragImage(ghost, 10, 10);
+      setTimeout(() => ghost.remove(), 0);
+    };
+    numEl.ondragend = () => {
+      numEl.style.cursor = "grab";
+      this.draggingId = null;
+      this.clearHoverStyles();
+    };
+
+    numEl.onclick = (e) => {
+      if ((e as any).detail === 0) return;
+      if (hasChildren) { e.preventDefault(); e.stopPropagation(); this.toggleNode(id); }
+    };
+
+    row.tr.addEventListener("dragover", (e) => this.onRowDragOver(e, row));
+    row.tr.addEventListener("dragleave", () => this.onRowDragLeave(row));
+    row.tr.addEventListener("drop", (e) => this.onRowDrop(e, row));
+  }
 
   private clearHoverStyles() {
     if (!this.hoverTarget) return;
@@ -404,12 +500,14 @@ export class TaskTableView extends ItemView {
 
     try {
       const st = this.scroller?.scrollTop ?? 0;
-      if (hover.mode === "on") {
-        await this.moveAsTopChild(source, target);
-      } else {
-        const after = hover.mode === "after";
-        await this.moveBetweenWithMaxNeighborDepth(source, target, after);
-      }
+      await this.withSquelch(async () => {
+        if (hover.mode === "on") {
+          await this.moveAsTopChild(source, target);
+        } else {
+          const after = hover.mode === "after";
+          await this.moveBetweenWithMaxNeighborDepth(source, target, after);
+        }
+      });
       await this.scanTasks();
       if (this.scroller) this.scroller.scrollTop = st;
       new Notice("Item moved.");
@@ -464,6 +562,7 @@ export class TaskTableView extends ItemView {
     tdRight.style.whiteSpace = "nowrap";
     tdRight.style.verticalAlign = "middle";
 
+    // open
     const openBtn = tdRight.createEl("button", { title: "Open" });
     openBtn.textContent = "↗";
     openBtn.style.fontSize = "14px";
@@ -477,6 +576,14 @@ export class TaskTableView extends ItemView {
       const editor = mdView?.editor ?? null;
       if (editor?.setCursor) editor.setCursor({ line: lineIndex, ch: 0 });
     };
+
+    // delete
+    const delBtn = tdRight.createEl("button", { title: "Delete task & subtasks" });
+    delBtn.textContent = "🗑";
+    delBtn.style.fontSize = "14px";
+    delBtn.style.lineHeight = "1";
+    delBtn.style.padding = "4px 8px";
+    delBtn.style.marginLeft = "6px";
 
     const rowRef: RowRef = {
       id,
@@ -492,6 +599,44 @@ export class TaskTableView extends ItemView {
       originalLine,
       rootToken,
       groupKey,
+    };
+
+    // AUTOSAVE & STATUS:
+    // mark dirty on input; debounce batch save; preserve caret by NOT rescanning on save
+    editable.addEventListener("input", () => {
+      this.markDirty();
+      this.scheduleAutosave();
+    });
+
+    // quick save on checkbox change (no re-render)
+    cb.onchange = async () => {
+      this.markDirty();
+      await this.saveRowImmediate({
+        filePath: file.path,
+        lineIndex,
+        originalLine: rowRef.originalLine,
+        checkbox: cb,
+        text: editable.textContent ?? "",
+      });
+      // update in-memory "originalLine" so subsequent saves diff correctly
+      rowRef.originalLine = this.buildLine(rowRef.originalLine, cb.checked, editable.textContent ?? "");
+      // don't force clean here; batch saver may still be pending for other edits
+    };
+
+    delBtn.onclick = async () => {
+      try {
+        this.setSaving(true);
+        const st = this.scroller?.scrollTop ?? 0;
+        await this.withSquelch(async () => { await this.deleteSubtree(rowRef); });
+        await this.scanTasks(); // delete requires re-render
+        if (this.scroller) this.scroller.scrollTop = st;
+        new Notice("Task deleted.");
+      } catch (e) {
+        console.error(e);
+        new Notice("Delete failed.");
+      } finally {
+        this.setSaving(false);
+      }
     };
 
     if (this.collapsedGroups.has(groupKey) || this.collapsedFiles.has(file.path)) {
@@ -593,49 +738,43 @@ export class TaskTableView extends ItemView {
     await this.relocateSubtree(source, destFilePath, insertAt, newDepth);
   }
 
-  /** Move a whole subtree (source and all descendants), adjusting indentation by depth delta. */
   private async relocateSubtree(source: RowRef, destFilePath: string, insertAt: number, newDepth: number) {
     const srcFile = this.app.vault.getAbstractFileByPath(source.filePath) as TFile;
     const destFile = this.app.vault.getAbstractFileByPath(destFilePath) as TFile;
 
-    // Read source lines
     let srcContent = await this.app.vault.read(srcFile);
     let srcLines = srcContent.split("\n");
 
     const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
 
-    // Determine subtree block [start..end] in source file
     const start = source.lineIndex;
     const srcDepth = getIndentDepth(srcLines[start] ?? source.originalLine);
     let end = start;
     for (let i = start + 1; i < srcLines.length; i++) {
       const ln = srcLines[i];
-      if (!taskRegex.test(ln)) { continue; }
+      if (!taskRegex.test(ln)) { break; }
       const d = getIndentDepth(ln);
-      if (d <= srcDepth) break; // next sibling or parent boundary
+      if (d <= srcDepth) break;
       end = i;
     }
     const blockLen = end - start + 1;
 
-    // Build adjusted block with new depths
     const depthDelta = newDepth - srcDepth;
     const adjustedBlock = srcLines.slice(start, end + 1).map((ln) => {
-      if (!taskRegex.test(ln)) return ln; // safety
+      if (!taskRegex.test(ln)) return ln;
       const d = getIndentDepth(ln);
       const nd = Math.max(1, d + depthDelta);
       return this.lineWithDepth(ln, nd);
     });
 
-    // Remove from source
-    srcLines.splice(start, blockLen);
-    await this.app.vault.modify(srcFile, srcLines.join("\n"));
+    // Remove from source (squelch rescans)
+    await this.withSquelch(async () => {
+      srcLines.splice(start, blockLen);
+      await this.app.vault.modify(srcFile, srcLines.join("\n"));
+    });
 
-    // Adjust insert index if moving within same file and source was before insertion
-    if (srcFile.path === destFile.path && start < insertAt) {
-      insertAt -= blockLen;
-    }
+    if (srcFile.path === destFile.path && start < insertAt) insertAt -= blockLen;
 
-    // Destination lines
     let destLines: string[];
     if (srcFile.path === destFile.path) {
       destLines = srcLines;
@@ -644,10 +783,11 @@ export class TaskTableView extends ItemView {
       destLines = destContent.split("\n");
     }
 
-    // Clamp + insert block
     insertAt = Math.max(0, Math.min(destLines.length, insertAt));
-    destLines.splice(insertAt, 0, ...adjustedBlock);
-    await this.app.vault.modify(destFile, destLines.join("\n"));
+    await this.withSquelch(async () => {
+      destLines.splice(insertAt, 0, ...adjustedBlock);
+      await this.app.vault.modify(destFile, destLines.join("\n"));
+    });
   }
 
   // ---------- scan / save ----------
@@ -656,19 +796,16 @@ export class TaskTableView extends ItemView {
     const planners = findPlannerFolders(this.app);
     if (planners.length === 0) {
       this.clearTableBody();
-      new Notice('No folders matching "Planner" found.');
       return;
     }
 
     const files = this.app.vault.getMarkdownFiles().filter((f: TFile) => isInAnyPlanner(f, planners));
     const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
 
-    // rebuild maps
     this.tasksByFile.clear();
     this.childrenById.clear();
     this.rowById.clear();
 
-    // Build groups → files → tasks
     const groupsMap = new Map<string, { name: string; files: Map<string, FileBucket> }>();
 
     for (const file of files) {
@@ -733,7 +870,7 @@ export class TaskTableView extends ItemView {
       const filesMap = groupsMap.get(gKey)!.files;
       if (!filesMap.has(file.path)) {
         const rawName = file.path.split("/").pop() ?? file.path;
-        const fileName = rawName.replace(/\.md$/i, ""); // strip ".md"
+        const fileName = rawName.replace(/\.md$/i, "");
         filesMap.set(file.path, { filePath: file.path, fileName, items: [] });
       }
       for (const e of rawEntries) filesMap.get(file.path)!.items.push(e);
@@ -774,13 +911,13 @@ export class TaskTableView extends ItemView {
       }
       this.styleAndWireNumber(row);
     }
-
-    const count = Array.from(this.tasksByFile.values()).reduce((n, a) => n + a.length, 0);
-    new Notice(`Loaded ${count} task(s).`);
   }
 
+  // Save currently rendered edits (batch). No re-render here → caret preserved.
   private async saveEdits() {
     if (!this.rowRefs.length || !this.tasksByFile.size) return;
+
+    const versionAtStart = this.editsVersion;
 
     const byFile = new Map<string, { lineIndex: number; newLine: string }[]>();
     for (const ref of this.rowRefs) {
@@ -790,23 +927,93 @@ export class TaskTableView extends ItemView {
       byFile.get(ref.filePath)!.push({ lineIndex: ref.lineIndex, newLine });
     }
 
-    let touched = 0;
-    for (const [path, edits] of byFile.entries()) {
-      edits.sort((a, b) => a.lineIndex - b.lineIndex);
-      const file = this.tasksByFile.get(path)?.[0]?.file;
-      if (!file) continue;
-      const content = await this.app.vault.read(file);
-      const lines = content.split("\n");
-      for (const e of edits) {
-        if (e.lineIndex >= 0 && e.lineIndex < lines.length) { lines[e.lineIndex] = e.newLine; touched++; }
+    try {
+      this.setSaving(true);
+      await this.withSquelch(async () => {
+        for (const [path, edits] of byFile.entries()) {
+          edits.sort((a, b) => a.lineIndex - b.lineIndex);
+          const file = this.tasksByFile.get(path)?.[0]?.file;
+          if (!file) continue;
+          const content = await this.app.vault.read(file);
+          const lines = content.split("\n");
+          for (const e of edits) {
+            if (e.lineIndex >= 0 && e.lineIndex < lines.length) {
+              lines[e.lineIndex] = e.newLine;
+            }
+          }
+          await this.app.vault.modify(file, lines.join("\n"));
+        }
+      });
+      // update in-memory originals so subsequent saves are idempotent
+      for (const ref of this.rowRefs) {
+        const text = (ref.textCell.textContent ?? "").trim();
+        ref.originalLine = this.buildLine(ref.originalLine, ref.checkbox.checked, text);
       }
-      await this.app.vault.modify(file, lines.join("\n"));
+      this.markCleanIfVersion(versionAtStart);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      this.setSaving(false);
+    }
+  }
+
+  // Save just one row (checkbox change / blur-safe if you add later). No re-render.
+  private async saveRowImmediate(args: {
+    filePath: string;
+    lineIndex: number;
+    originalLine: string;
+    checkbox: HTMLInputElement;
+    text: string;
+  }) {
+    const { filePath, lineIndex, originalLine, checkbox, text } = args;
+    const file = this.app.vault.getAbstractFileByPath(filePath) as TFile;
+    if (!file) return;
+
+    try {
+      this.setSaving(true);
+      await this.withSquelch(async () => {
+        const content = await this.app.vault.read(file);
+        const lines = content.split("\n");
+        if (lineIndex < 0 || lineIndex >= lines.length) return;
+        const newLine = this.buildLine(originalLine, checkbox.checked, (text ?? "").trim());
+        if (lines[lineIndex] === newLine) return;
+        lines[lineIndex] = newLine;
+        await this.app.vault.modify(file, lines.join("\n"));
+      });
+    } finally {
+      this.setSaving(false);
+      // do NOT mark clean here; batch save may still be pending for other edits
+    }
+  }
+
+  // Delete a row and its indented descendants; then file is saved.
+  private async deleteSubtree(row: RowRef) {
+    const srcFile = this.app.vault.getAbstractFileByPath(row.filePath) as TFile;
+    if (!srcFile) return;
+
+    const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
+
+    const content = await this.app.vault.read(srcFile);
+    const lines = content.split("\n");
+    const start = row.lineIndex;
+    if (start < 0 || start >= lines.length) return;
+
+    const base = lines[start] ?? row.originalLine;
+    if (!taskRegex.test(base)) return;
+
+    const srcDepth = getIndentDepth(base);
+    let end = start;
+    for (let i = start + 1; i < lines.length; i++) {
+      const ln = lines[i];
+      if (!taskRegex.test(ln)) break;
+      const d = getIndentDepth(ln);
+      if (d <= srcDepth) break;
+      end = i;
     }
 
-    const st = this.scroller?.scrollTop ?? 0;
-    new Notice(`Task edits saved (${touched}).`);
-    await this.scanTasks();
-    if (this.scroller) this.scroller.scrollTop = st;
+    const blockLen = end - start + 1;
+    lines.splice(start, blockLen);
+    await this.app.vault.modify(srcFile, lines.join("\n"));
   }
 }
 

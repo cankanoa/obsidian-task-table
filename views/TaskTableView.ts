@@ -215,15 +215,22 @@ export class TaskTableView extends ItemView {
 .task-row.hover-top { border-top-color: var(--text-accent); }
 .task-row.hover-bottom { border-bottom-color: var(--text-accent); }
 
+/* show normal dividing lines between rows */
+.task-cell { border-bottom: 1px solid var(--background-modifier-border); }
+
 /* placeholder new-row styling */
 .task-new .placeholder { color: var(--text-muted); }
+.task-new .plus {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:1.5em; min-width:1.5em; height:1.5em; border-radius:4px;
+  font-weight:700; opacity:0.7; user-select:none;
+}
 
-/* keep controls pinned to top on multiline, but center on single-line */
-.row-wrap { display:flex; align-items:center; gap:6px; min-width:0; }
-.task-row.multiline .row-wrap { align-items:flex-start; }
+/* keep controls pinned to top always (no vertical shifting) */
+.row-wrap { display:flex; align-items:flex-start; gap:6px; min-width:0; }
 
-/* cells */
-.task-cell { vertical-align: top; }
+/* fix top alignment for controls regardless of multiline content */
+.row-wrap .num, .row-wrap input[type="checkbox"] { margin-top: 2px; }
 
 /* consistent font in edit vs preview */
 .task-edit, .task-preview { font-size: var(--font-ui-medium, 14px); line-height: 1.4; }
@@ -486,6 +493,7 @@ export class TaskTableView extends ItemView {
   private styleAndWireNumber(row: RowRef) {
     const { numEl, hasChildren, id, depth, rootToken } = row;
 
+    numEl.classList.add("num");
     numEl.style.display = "inline-flex";
     numEl.style.alignItems = "center";
     numEl.style.justifyContent = "center";
@@ -628,14 +636,14 @@ export class TaskTableView extends ItemView {
     const tdLeft = tr.createEl("td");
     tdLeft.classList.add("task-cell");
     tdLeft.style.padding = "6px 8px";
-    tdLeft.style.borderBottom = "1px solid var(--background-modifier-border)";
     tdLeft.style.verticalAlign = "top";
     tdLeft.style.width = "100%";
 
     const leftWrap = tdLeft.createDiv();
-    leftWrap.addClass("row-wrap"); // alignment controlled via .multiline class on row
+    leftWrap.addClass("row-wrap"); // alignment controlled by CSS
 
     const numEl = leftWrap.createSpan({ text: String(depth) });
+    numEl.classList.add("num");
 
     const cb = leftWrap.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
     cb.checked = checked;
@@ -667,7 +675,6 @@ export class TaskTableView extends ItemView {
     const tdRight = tr.createEl("td");
     tdRight.classList.add("task-cell");
     tdRight.style.padding = "6px 8px";
-    tdRight.style.borderBottom = "1px solid var(--background-modifier-border)";
     tdRight.style.textAlign = "right";
     tdRight.style.whiteSpace = "nowrap";
     tdRight.style.verticalAlign = "top";
@@ -793,7 +800,7 @@ export class TaskTableView extends ItemView {
     this.styleAndWireNumber(rowRef);
   }
 
-  // Keep single-line centered; multiline pinned to top
+  // Keep single-line centered; multiline pinned to top (controls already fixed to top)
   private updateRowLayout(row: RowRef, text: string) {
     const isMulti = /\n/.test(text || "") || (row.previewCell?.innerText || "").includes("\n");
     if (isMulti) row.tr.classList.add("multiline");
@@ -1041,7 +1048,7 @@ export class TaskTableView extends ItemView {
       for (const e of rawEntries) {
         if (e.parentId) {
           if (!this.childrenById.has(e.parentId)) this.childrenById.set(e.parentId, []);
-        this.childrenById.get(e.parentId)!.push(e.id);
+          this.childrenById.get(e.parentId)!.push(e.id);
         }
         fileTasks.push(e);
       }
@@ -1232,17 +1239,21 @@ export class TaskTableView extends ItemView {
     const tdLeft = tr.createEl("td");
     tdLeft.classList.add("task-cell");
     tdLeft.style.padding = "6px 8px";
-    tdLeft.style.borderBottom = "1px solid var(--background-modifier-border)";
     tdLeft.style.verticalAlign = "top";
     tdLeft.style.width = "100%";
 
     const leftWrap = tdLeft.createDiv();
     leftWrap.addClass("row-wrap");
-    // create invisible number + checkbox to reserve exact space so text aligns perfectly
-    const ghostNum = leftWrap.createSpan({ text: "1" });
-    ghostNum.style.visibility = "hidden";
+
+    // Visible PLUS icon (replaces the "bullet" affordance)
+    const plus = leftWrap.createSpan({ text: "+" });
+    plus.addClass("plus");
+    plus.title = "Add new task";
+
+    // Hidden checkbox spacer (to align the text with normal rows)
     const ghostCb = leftWrap.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
     ghostCb.style.visibility = "hidden";
+    ghostCb.style.flex = "0 0 auto";
 
     const textWrap = leftWrap.createDiv();
     textWrap.style.flex = "1 1 auto";
@@ -1258,7 +1269,6 @@ export class TaskTableView extends ItemView {
     const tdRight = tr.createEl("td");
     tdRight.classList.add("task-cell");
     tdRight.style.padding = "6px 8px";
-    tdRight.style.borderBottom = "1px solid var(--background-modifier-border)";
     tdRight.style.textAlign = "right";
     tdRight.style.whiteSpace = "nowrap";
     tdRight.style.verticalAlign = "top";
@@ -1269,7 +1279,7 @@ export class TaskTableView extends ItemView {
       tr.style.display = "none";
     }
 
-    // click to clear placeholder text
+    // Placeholder life-cycle: clear on focus/click; restore on blur if empty
     const clearPlaceholder = () => {
       if (input.classList.contains("placeholder")) {
         input.empty();
@@ -1279,10 +1289,18 @@ export class TaskTableView extends ItemView {
     input.addEventListener("focus", clearPlaceholder);
     input.addEventListener("click", clearPlaceholder);
 
+    input.addEventListener("blur", () => {
+      const txt = (input.textContent ?? "").trim();
+      if (!txt) {
+        input.setText("New");
+        input.classList.add("placeholder");
+      }
+    });
+
     // create on commit
     const commitCreate = async () => {
       const text = (input.textContent ?? "").trim();
-      if (!text) return;
+      if (!text || input.classList.contains("placeholder")) return;
       await this.createNewTaskAtEnd(filePath, text);
     };
 

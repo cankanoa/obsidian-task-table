@@ -9,7 +9,7 @@ import {
   MarkdownRenderer,
   Component,
 } from "obsidian";
-import { TASK_TABLE_VIEW_TYPE } from "../main";
+import { TASK_TABLE_VIEW_TYPE, MyPluginSettings, TaskTableRule } from "../main";
 
 type TaskEntry = {
   file: TFile;
@@ -142,8 +142,11 @@ export class TaskTableView extends ItemView {
   // after creating a new item, focus it
   private pendingFocusId: string | null = null;
 
-  constructor(leaf: WorkspaceLeaf) {
+  private plugin: { settings: MyPluginSettings; openSettings: () => void };
+
+  constructor(leaf: WorkspaceLeaf, plugin: { settings: MyPluginSettings; openSettings: () => void }) {
     super(leaf);
+    this.plugin = plugin;
   }
   getViewType() {
     return TASK_TABLE_VIEW_TYPE;
@@ -167,10 +170,36 @@ export class TaskTableView extends ItemView {
     this.statusBar.style.flex = "0 0 auto";
     this.statusBar.style.display = "flex";
     this.statusBar.style.alignItems = "center";
-    this.statusBar.style.justifyContent = "flex-end";
+	this.statusBar.style.justifyContent = "space-between";
     this.statusBar.style.height = "28px";
     this.statusBar.style.padding = "0 12px 0 8px"; // slight right margin so it's not glued to edge
     this.statusBar.style.borderBottom = "1px solid var(--background-modifier-border)";
+
+	const leftWrap = this.statusBar.createDiv();
+	leftWrap.style.display = "inline-flex";
+	leftWrap.style.alignItems = "center";
+	leftWrap.style.gap = "8px";
+
+	// Gear button (opens plugin settings)
+	const gearBtn = leftWrap.createEl("button");
+	gearBtn.setAttr("aria-label", "Open settings");
+	gearBtn.style.background = "transparent";
+	gearBtn.style.border = "none";
+	gearBtn.style.outline = "none";
+	gearBtn.style.boxShadow = "none";
+	gearBtn.style.padding = "0 4px";
+	gearBtn.style.cursor = "pointer";
+	gearBtn.style.fontSize = "16px";
+	gearBtn.textContent = "⚙︎";
+	gearBtn.onclick = () => this.plugin.openSettings();
+
+	// Right side wrapper for status/checkmark (keeps your existing statusIcon on the right)
+	const rightWrap = this.statusBar.createDiv();
+	rightWrap.style.display = "inline-flex";
+	rightWrap.style.alignItems = "center";
+
+	// Move the existing statusIcon creation to use rightWrap instead of this.statusBar:
+	this.statusIcon = rightWrap.createSpan();
 
     this.statusIcon = this.statusBar.createSpan();
     this.statusIcon.setAttr("aria-label", "save status");
@@ -241,33 +270,26 @@ export class TaskTableView extends ItemView {
     await this.scanTasks();
 
     // auto-scan: vault changes that touch Planner files, but skip while we are saving
-    const vault = this.app.vault;
-    const onFsChange = async (af: any) => {
-      if (this.squelchScanDepth > 0) return;
-      if (!(af instanceof TFile)) return;
-      const planners = findPlannerFolders(this.app);
-      if (isInAnyPlanner(af, planners)) this.scheduleRescan();
-    };
-    const onDelete = async (af: any) => {
-      if (this.squelchScanDepth > 0) return;
-      if (!(af instanceof TFile)) return;
-      const planners = findPlannerFolders(this.app);
-      if (isInAnyPlanner(af, planners)) this.scheduleRescan();
-    };
+	const vault = this.app.vault;
+	const onFsChange = async (af: any) => {
+	  if (this.squelchScanDepth > 0) return;
+	  if (!(af instanceof TFile)) return;
+	  if (af.extension !== "md") return;
+	  this.scheduleRescan();
+	};
+	vault.on("modify", onFsChange);
+	vault.on("create", onFsChange);
+	vault.on("rename", onFsChange);
+	vault.on("delete", onFsChange);
 
-    vault.on("modify", onFsChange);
-    vault.on("create", onFsChange);
-    vault.on("rename", onFsChange);
-    vault.on("delete", onDelete);
+	const onFileOpen = () => this.scheduleRescan();
+	this.app.workspace.on("file-open", onFileOpen);
 
-    const onFileOpen = () => this.scheduleRescan();
-    this.app.workspace.on("file-open", onFileOpen);
-
-    this.disposers.push(() => vault.off("modify", onFsChange));
-    this.disposers.push(() => vault.off("create", onFsChange));
-    this.disposers.push(() => vault.off("rename", onFsChange));
-    this.disposers.push(() => vault.off("delete", onDelete));
-    this.disposers.push(() => this.app.workspace.off("file-open", onFileOpen));
+	this.disposers.push(() => vault.off("modify", onFsChange));
+	this.disposers.push(() => vault.off("create", onFsChange));
+	this.disposers.push(() => vault.off("rename", onFsChange));
+	this.disposers.push(() => vault.off("delete", onFsChange));
+	this.disposers.push(() => this.app.workspace.off("file-open", onFileOpen));
   }
 
   async onClose() {
@@ -973,15 +995,27 @@ export class TaskTableView extends ItemView {
   // ---------- scan / save ----------
 
   private async scanTasks() {
-    const planners = findPlannerFolders(this.app);
-    if (planners.length === 0) {
+    const rules: TaskTableRule[] = Array.isArray(this.plugin?.settings?.regexRules)
+      ? this.plugin.settings.regexRules
+      : [];
+
+    // If no rules, clear and bail.
+    if (!rules.length) {
       this.clearTableBody();
       return;
     }
 
-    const files = this.app.vault
-      .getMarkdownFiles()
-      .filter((f: TFile) => isInAnyPlanner(f, planners));
+    // Precompile regexes
+    const compiled = rules
+      .map((r) => {
+        try {
+          return { name: r.name, re: new RegExp(r.re) };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean) as { name: string; re: RegExp }[];
+
     const taskRegex = /^\s*[-*]\s\[[ xX]\]\s.+/;
 
     this.tasksByFile.clear();
@@ -989,19 +1023,28 @@ export class TaskTableView extends ItemView {
     this.rowById.clear();
     this.newRowByFile.clear();
 
-    const groupsMap = new Map<string, { name: string; files: Map<string, FileBucket> }>();
+    // Map: groupName -> (Map: filePath -> FileBucket)
+    const groupsMap = new Map<string, Map<string, FileBucket>>();
 
-    for (const file of files) {
+    // Collect matching files per rule
+    const allMdFiles: TFile[] = this.app.vault.getMarkdownFiles();
+
+    // A file can appear under multiple groups if multiple rules (even with different names) match.
+    for (const file of allMdFiles) {
+      const path = file.path;
+      const matchedGroups = compiled.filter((c) => c.re.test(path)).map((c) => c.name);
+      if (!matchedGroups.length) continue;
+
+      // Parse tasks in file once
       const content = await this.app.vault.read(file);
       const lines = content.split("\n");
-      const fileTasks: TaskEntry[] = [];
 
+      const rawEntries: TaskEntry[] = [];
       let currentRootKey = "";
       let currentRootToken = "";
       let lastSeenDepth1Key = "";
       let lastSeenRootToken = "";
 
-      const rawEntries: TaskEntry[] = [];
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         if (!taskRegex.test(line)) continue;
@@ -1036,7 +1079,7 @@ export class TaskTableView extends ItemView {
         });
       }
 
-      // parentId via stack
+      // Parent links via stack
       const stack: TaskEntry[] = [];
       for (const e of rawEntries) {
         while (stack.length && stack[stack.length - 1].depth >= e.depth) stack.pop();
@@ -1044,59 +1087,67 @@ export class TaskTableView extends ItemView {
         stack.push(e);
       }
 
-      // build children
+      // Children index
       for (const e of rawEntries) {
         if (e.parentId) {
           if (!this.childrenById.has(e.parentId)) this.childrenById.set(e.parentId, []);
           this.childrenById.get(e.parentId)!.push(e.id);
         }
-        fileTasks.push(e);
       }
 
-      if (fileTasks.length) this.tasksByFile.set(file.path, fileTasks);
-
-      // register into group/file buckets
-      const { key: gKey, name: gName } = getGroupFromPath(file.path);
-      if (!groupsMap.has(gKey)) groupsMap.set(gKey, { name: gName, files: new Map() });
-      const filesMap = groupsMap.get(gKey)!.files;
-      if (!filesMap.has(file.path)) {
-        const rawName = file.path.split("/").pop() ?? file.path;
-        const fileName = rawName.replace(/\.md$/i, "");
-        filesMap.set(file.path, { filePath: file.path, fileName, items: [] });
+      // Put this file's entries under each matched group name
+      for (const gName of matchedGroups) {
+        if (!groupsMap.has(gName)) groupsMap.set(gName, new Map<string, FileBucket>());
+        const filesMap = groupsMap.get(gName)!;
+        if (!filesMap.has(file.path)) {
+          const rawName = path.split("/").pop() ?? path;
+          const fileName = rawName.replace(/\.md$/i, "");
+          filesMap.set(file.path, { filePath: path, fileName, items: [] });
+        }
+        filesMap.get(file.path)!.items.push(...rawEntries);
       }
-      for (const e of rawEntries) filesMap.get(file.path)!.items.push(e);
+
+      if (rawEntries.length) this.tasksByFile.set(file.path, rawEntries);
     }
 
-    // flatten into ordered buckets
-    const groupBuckets: GroupBucket[] = [];
-    for (const [gKey, gVal] of groupsMap) {
-      const filesArr: FileBucket[] = Array.from(gVal.files.values());
-      groupBuckets.push({ key: gKey, name: gVal.name, files: filesArr });
+    // Nothing matched: clear table and stop
+    if (groupsMap.size === 0) {
+      this.clearTableBody();
+      return;
     }
 
-    // render
+    // Render
     this.clearTableBody();
 
-    for (const gb of groupBuckets) {
+    // Deterministic order by group name, then file name
+    const groupNames = Array.from(groupsMap.keys()).sort((a, b) => a.localeCompare(b));
+    for (const gName of groupNames) {
+      const filesMap = groupsMap.get(gName)!;
+      const filesArr = Array.from(filesMap.values()).sort((a, b) =>
+        a.fileName.localeCompare(b.fileName)
+      );
+
+      // Build GroupBucket on the fly
+      const gb = { key: gName, name: gName, files: filesArr };
       this.addGroupSubheader(gb);
-      for (const fb of gb.files) {
+
+      for (const fb of filesArr) {
         this.addFileSubheader(fb, gb.key);
         for (const e of fb.items) {
           const hasChildren = !!this.childrenById.get(e.id)?.length;
           this.addTaskRow(e, hasChildren, gb.key);
         }
-        // always add a placeholder "New" row at end of each file
         this.addNewPlaceholderRow(fb.filePath, gb.key);
       }
     }
 
-    // bottom padding dummy row
+    // bottom padding row
     const padTr = this.tbody.createEl("tr");
     const padTd = padTr.createEl("td");
     padTd.colSpan = 2;
     padTd.style.padding = "12px 8px";
 
-    // apply node collapse & recolor, silently to avoid chevron transition re-trigger
+    // Re-apply collapse & recolor silently
     this.silentStylePass = true;
     for (const row of this.rowRefs) {
       if (this.hasCollapsedAncestor(row.id)) row.tr.style.display = "none";
@@ -1107,7 +1158,7 @@ export class TaskTableView extends ItemView {
     }
     this.silentStylePass = false;
 
-    // focus a newly created item if requested
+    // Focus any newly created item
     if (this.pendingFocusId) {
       const ref = this.rowById.get(this.pendingFocusId);
       this.pendingFocusId = null;

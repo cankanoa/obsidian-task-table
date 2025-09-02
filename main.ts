@@ -63,6 +63,17 @@ export default class MyPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	async notifySettingsChanged() {
+		await this.saveSettings(); // persist
+		// refresh all open TaskTable views
+		for (const leaf of this.app.workspace.getLeavesOfType(TASK_TABLE_VIEW_TYPE)) {
+			const v = leaf.view as any;
+			if (typeof v.refresh === "function") {
+				await v.refresh();
+			}
+		}
+	}
 }
 
 class RulesSettingTab extends PluginSettingTab {
@@ -150,5 +161,10 @@ class RulesSettingTab extends PluginSettingTab {
 		};
 
 		render();
+	}
+
+	hide(): void {
+		// when the user leaves the tab, re-render the view(s)
+		this.plugin.notifySettingsChanged();
 	}
 }

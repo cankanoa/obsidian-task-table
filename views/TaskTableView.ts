@@ -37,4 +37,10 @@ export class TaskTableView extends ItemView {
 	async onClose() {
 		// noop — Store cleans itself when re-mounted
 	}
+
+	async refresh() {
+		if (!this.store) return;
+		this.store.settings = this.plugin.settings;
+		await mountTable(this.store);
+	}
 }

@@ -1,13 +1,22 @@
 import { Store } from "../state/store";
 import { buildLine } from "../utils/text";
 
-const autosaveDebounced = new Map<Store, number>();
+// WeakMap so the Store can be GC’d when the view closes
+const autosaveDebounced: WeakMap<Store, number> = new WeakMap();
 
 export function scheduleAutosave(store: Store) {
 	const prev = autosaveDebounced.get(store);
 	if (prev) window.clearTimeout(prev);
 	const t = window.setTimeout(() => saveEdits(store), 600);
 	autosaveDebounced.set(store, t);
+}
+
+// allow view to cancel onClose
+export function clearAutosave(store: Store | null) {
+	if (!store) return;
+	const t = autosaveDebounced.get(store);
+	if (t) window.clearTimeout(t);
+	autosaveDebounced.delete(store);
 }
 
 export async function saveEdits(store: Store) {
@@ -47,42 +56,55 @@ export async function saveEdits(store: Store) {
 	}
 }
 
+// === The two missing functions used by ui/render.ts ===
+
 export async function saveRowImmediate(store: Store, args: {
-	filePath: string; lineIndex: number; originalLine: string; checked: boolean; text: string;
+	filePath: string;
+	lineIndex: number;
+	originalLine: string;
+	checked: boolean;
+	text: string;
 }) {
 	const { filePath, lineIndex, originalLine, checked, text } = args;
-	const file = store.app.vault.getAbstractFileByPath(filePath);
+	const file = store.app.vault.getAbstractFileByPath(filePath) as any;
 	if (!file) return;
+
 	try {
 		store.setSaving(true);
 		await store.withSquelch(async () => {
-			const content = await store.app.vault.read(file as any);
+			const content = await store.app.vault.read(file);
 			const lines = content.split("\n");
 			if (lineIndex < 0 || lineIndex >= lines.length) return;
 			const newLine = buildLine(originalLine, checked, (text ?? "").trim());
 			if (lines[lineIndex] === newLine) return;
 			lines[lineIndex] = newLine;
-			await store.app.vault.modify(file as any, lines.join("\n"));
+			await store.app.vault.modify(file, lines.join("\n"));
 		});
 	} finally {
 		store.setSaving(false);
+		// don't mark clean here; batch save may still be pending
 	}
 }
 
 export async function createNewTaskAtEnd(store: Store, filePath: string, text: string) {
-	const file = store.app.vault.getAbstractFileByPath(filePath);
+	const file = store.app.vault.getAbstractFileByPath(filePath) as any;
 	if (!file) return;
+
 	try {
 		store.setSaving(true);
 		await store.withSquelch(async () => {
-			const content = await store.app.vault.read(file as any);
+			const content = await store.app.vault.read(file);
 			const lines = content.length ? content.split("\n") : [];
+			// insert before a trailing empty line if present
 			let insertAt = lines.length;
 			if (insertAt > 0 && lines[insertAt - 1] === "") insertAt = insertAt - 1;
+
 			const newLine = `- [ ] ${text}`;
 			lines.splice(insertAt, 0, newLine);
 			const out = lines.join("\n");
-			await store.app.vault.modify(file as any, out.endsWith("\n") ? out : out + "\n");
+			await store.app.vault.modify(file, out.endsWith("\n") ? out : out + "\n");
+
+			// focus the newly created item after next rescan
 			store.pendingFocusId = `${filePath}::${insertAt}`;
 		});
 	} finally {

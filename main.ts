@@ -65,12 +65,11 @@ export default class MyPlugin extends Plugin {
 	}
 
 	async notifySettingsChanged() {
-		await this.saveSettings(); // persist
-		// refresh all open TaskTable views
+		await this.saveSettings();
 		for (const leaf of this.app.workspace.getLeavesOfType(TASK_TABLE_VIEW_TYPE)) {
-			const v = leaf.view as any;
-			if (typeof v.refresh === "function") {
-				await v.refresh();
+			const view = leaf.view;
+			if (view instanceof TaskTableView) {
+				await view.refresh();
 			}
 		}
 	}

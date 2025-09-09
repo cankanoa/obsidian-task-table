@@ -29,11 +29,14 @@ export class TaskTableView extends ItemView {
 		this.store = new Store(this.app, this.plugin.settings, ui);
 		await mountTable(this.store);
 
-		// keep disposer so we can remove listeners on close
-		this.disposeAutoscan = wireAutoscan(this.app, async () => {
-			if (!this.store) return;
-			await mountTable(this.store);
-		});
+		this.disposeAutoscan = wireAutoscan(
+			this.app,
+			this.store,   // ← pass the store
+			async () => {
+				if (!this.store) return;
+				await mountTable(this.store);
+			}
+		);
 	}
 
 	// Allow plugin to re-render after settings close

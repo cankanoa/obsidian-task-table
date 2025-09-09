@@ -1,5 +1,6 @@
 import { AppLike, UIRefs, RowRef, ScanResult } from "../types";
 import { MyPluginSettings } from "../main";
+import { updateStatusIcon } from "../ui/render"
 
 export class Store {
 	app: AppLike;
@@ -43,10 +44,18 @@ export class Store {
 
 	setSaving(on: boolean) {
 		this.savingDepth = Math.max(0, this.savingDepth + (on ? 1 : -1));
+		updateStatusIcon(this);
 	}
-	markDirty() { this.dirty = true; this.editsVersion++; }
+	markDirty() {
+		this.dirty = true;
+		this.editsVersion++;
+		updateStatusIcon(this);
+	}
 	markCleanIf(versionAtStart: number) {
-		if (this.editsVersion === versionAtStart) this.dirty = false;
+		if (this.editsVersion === versionAtStart) {
+			this.dirty = false;
+			updateStatusIcon(this);
+		}
 	}
 	async withSquelch<T>(fn: () => Promise<T>): Promise<T> {
 		this.squelchScanDepth++;

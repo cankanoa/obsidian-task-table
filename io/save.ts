@@ -1,5 +1,6 @@
 import { Store } from "../state/store";
 import { buildLine } from "../utils/text";
+import { mountTable } from "../ui/render";        // <-- path: wherever your mountTable lives
 
 // WeakMap so the Store can be GC’d when the view closes
 const autosaveDebounced: WeakMap<Store, number> = new WeakMap();
@@ -41,7 +42,9 @@ export async function saveEdits(store: Store) {
 				const content = await store.app.vault.read(file);
 				const lines = content.split("\n");
 				for (const e of edits) {
-					if (e.lineIndex >= 0 && e.lineIndex < lines.length) lines[e.lineIndex] = e.newLine;
+					if (e.lineIndex >= 0 && e.lineIndex < lines.length) {
+						lines[e.lineIndex] = e.newLine;
+					}
 				}
 				await store.app.vault.modify(file, lines.join("\n"));
 			}
@@ -49,8 +52,15 @@ export async function saveEdits(store: Store) {
 		for (const ref of store.rowRefs) {
 			const text = (ref.textCell.textContent ?? "").trim();
 			ref.originalLine = buildLine(ref.originalLine, ref.checkbox.checked, text);
+
+			// ⬇️ refresh preview if it's shown (matches old TaskTableView)
+			if ((ref.previewCell as any)?.isShown?.()) {
+				await renderRowMarkdown(store, ref);
+			}
 		}
 		store.markCleanIf(versionAtStart);
+	} catch (e) {
+		console.error(e);
 	} finally {
 		store.setSaving(false);
 	}
@@ -92,9 +102,13 @@ export async function createNewTaskAtEnd(store: Store, filePath: string, text: s
 
 	try {
 		store.setSaving(true);
+		const scroller = store.ui?.scroller;
+		const prevScroll = scroller?.scrollTop ?? 0;
+
 		await store.withSquelch(async () => {
 			const content = await store.app.vault.read(file);
 			const lines = content.length ? content.split("\n") : [];
+
 			// insert before a trailing empty line if present
 			let insertAt = lines.length;
 			if (insertAt > 0 && lines[insertAt - 1] === "") insertAt = insertAt - 1;
@@ -104,9 +118,14 @@ export async function createNewTaskAtEnd(store: Store, filePath: string, text: s
 			const out = lines.join("\n");
 			await store.app.vault.modify(file, out.endsWith("\n") ? out : out + "\n");
 
-			// focus the newly created item after next rescan
+			// focus the newly created item after remount
 			store.pendingFocusId = `${filePath}::${insertAt}`;
 		});
+
+		// ⬇️ DO THE REMOUNT AFTER squelch so focus can be applied
+		await mountTable(store);
+
+		if (scroller) scroller.scrollTop = prevScroll;
 	} finally {
 		store.setSaving(false);
 	}

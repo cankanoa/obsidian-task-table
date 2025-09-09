@@ -76,7 +76,7 @@ export async function mountTable(store: Store) {
 }
 
 
-function updateStatusIcon(store: Store) {
+export function updateStatusIcon(store: Store) {
 	const el = store.ui.statusIcon;
 	el.style.display = "inline-block";
 	el.style.lineHeight = "1";

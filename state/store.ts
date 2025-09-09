@@ -29,7 +29,6 @@ export class Store {
 	hoverTarget: { id: string; mode: "on" | "before" | "after" } | null = null;
 
 	hueByRootToken = new Map<string, number>();
-	hueOrder = 0;
 	readonly GOLDEN_ANGLE = 137.508;
 	readonly huePhase = Math.random() * 360;
 	SAT = 78; L_BASE = 42; L_STEP = 20; L_MAX = 90;
@@ -66,6 +65,19 @@ export class Store {
 	applyScan(result: ScanResult) {
 		this.tasksByFile = result.tasksByFile;
 		this.childrenById = result.childrenById;
+
+		this.hueByRootToken.clear();
+
+		const tokens = new Set<string>();
+		for (const tasks of result.tasksByFile.values()) {
+			for (const t of tasks) tokens.add(t.rootToken);
+		}
+
+		const ordered = Array.from(tokens).sort((a, b) => a.localeCompare(b));
+		for (let i = 0; i < ordered.length; i++) {
+			const hue = (this.huePhase + i * this.GOLDEN_ANGLE) % 360;
+			this.hueByRootToken.set(ordered[i], hue);
+		}
 	}
 
 	resetTableMaps() {

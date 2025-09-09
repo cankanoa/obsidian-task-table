@@ -53,7 +53,6 @@ export async function saveEdits(store: Store) {
 			const text = (ref.textCell.textContent ?? "").trim();
 			ref.originalLine = buildLine(ref.originalLine, ref.checkbox.checked, text);
 
-			// ⬇️ refresh preview if it's shown (matches old TaskTableView)
 			if ((ref.previewCell as any)?.isShown?.()) {
 				await renderRowMarkdown(store, ref);
 			}

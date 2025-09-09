@@ -1,6 +1,7 @@
 import { Store } from "../state/store";
 import { buildLine } from "../utils/text";
-import { mountTable } from "../ui/render";        // <-- path: wherever your mountTable lives
+import { mountTable } from "../ui/render";
+import { MarkdownRenderer, Component } from "obsidian";
 
 // WeakMap so the Store can be GC’d when the view closes
 const autosaveDebounced: WeakMap<Store, number> = new WeakMap();
@@ -54,7 +55,7 @@ export async function saveEdits(store: Store) {
 			ref.originalLine = buildLine(ref.originalLine, ref.checkbox.checked, text);
 
 			if ((ref.previewCell as any)?.isShown?.()) {
-				await renderRowMarkdown(store, ref);
+				await renderWithObsidian(store, ref, text);
 			}
 		}
 		store.markCleanIf(versionAtStart);
@@ -65,7 +66,24 @@ export async function saveEdits(store: Store) {
 	}
 }
 
-// === The two missing functions used by ui/render.ts ===
+async function renderWithObsidian(store: Store, ref: any, markdown: string) {
+	// Clean previous render/component
+	(ref as any).__mdComp?.unload?.();
+	ref.previewCell.empty();
+
+	// Create a lifecycle component for this render
+	const comp = new Component();
+	(ref as any).__mdComp = comp;
+
+	// Render plain task text as markdown in the preview cell
+	await MarkdownRenderer.render(
+		store.app as any,
+		markdown ?? "",
+		ref.previewCell,
+		ref.filePath,
+		comp
+	);
+}
 
 export async function saveRowImmediate(store: Store, args: {
 	filePath: string;
@@ -121,7 +139,6 @@ export async function createNewTaskAtEnd(store: Store, filePath: string, text: s
 			store.pendingFocusId = `${filePath}::${insertAt}`;
 		});
 
-		// ⬇️ DO THE REMOUNT AFTER squelch so focus can be applied
 		await mountTable(store);
 
 		if (scroller) scroller.scrollTop = prevScroll;

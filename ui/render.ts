@@ -8,59 +8,70 @@ import * as Move from "../io/move";
 import * as Save from "../io/save";
 
 export async function mountTable(store: Store) {
+	const scroller = store.ui?.scroller;
+	const prevScroll = scroller?.scrollTop ?? 0;
+
 	const compiled = compileRules(store.settings.regexRules ?? []);
 	const result = await scanTasks(store.app, compiled);
 	store.applyScan(result);
 
-	// clear table
+	// Clear table
 	for (const r of store.rowRefs) r.mdComp?.unload?.();
 	store.resetTableMaps();
 	store.ui.tbody.empty();
 
 	updateStatusIcon(store);
 
-	if (!result.groups.length) {
-		// nothing to render
-	} else if (!result.hasGroups) {
-		const only = result.groups[0]; // key="__ALL__", name=""
-		for (const fb of only.files) {
-			const fileKey = `__ALL__::${fb.filePath}`;
-			addFileHeader(store, fb.filePath, fb.fileName, /*groupKey*/ "__ALL__", /*showGroupHeader*/ false, fileKey);
-			for (const e of fb.items) addTaskRow(store, e, !!store.childrenById.get(e.id)?.length, "__ALL__", fileKey);
-			addNewPlaceholder(store, fb.filePath, "__ALL__", fileKey);
-		}
-	} else {
-		for (const group of result.groups) {
-			addGroupHeader(store, group);
-			for (const fb of group.files) {
-				const fileKey = `${group.key}::${fb.filePath}`;
-				addFileHeader(store, fb.filePath, fb.fileName, group.key, /*showGroupHeader*/ true, fileKey);
-				for (const e of fb.items) addTaskRow(store, e, !!store.childrenById.get(e.id)?.length, group.key, fileKey);
-				addNewPlaceholder(store, fb.filePath, group.key, fileKey);
+	// Rebuild table content
+	if (result.groups.length > 0) {
+		if (!result.hasGroups) {
+			const only = result.groups[0]; // "__ALL__"
+			for (const fb of only.files) {
+				const fileKey = `__ALL__::${fb.filePath}`;
+				addFileHeader(store, fb.filePath, fb.fileName, "__ALL__", false, fileKey);
+				for (const e of fb.items) {
+					addTaskRow(store, e, !!store.childrenById.get(e.id)?.length, "__ALL__", fileKey);
+				}
+				addNewPlaceholder(store, fb.filePath, "__ALL__", fileKey);
+			}
+		} else {
+			for (const group of result.groups) {
+				addGroupHeader(store, group);
+				for (const fb of group.files) {
+					const fileKey = `${group.key}::${fb.filePath}`;
+					addFileHeader(store, fb.filePath, fb.fileName, group.key, true, fileKey);
+					for (const e of fb.items) {
+						addTaskRow(store, e, !!store.childrenById.get(e.id)?.length, group.key, fileKey);
+					}
+					addNewPlaceholder(store, fb.filePath, group.key, fileKey);
+				}
 			}
 		}
 	}
 
-	// padding
+	// Padding row
 	const padTr = store.ui.tbody.createEl("tr");
 	const padTd = padTr.createEl("td");
 	padTd.colSpan = 2;
 	padTd.style.padding = "12px 8px";
 
-	// re-apply styles
+	// Style pass
 	store.silentStylePass = true;
 	for (const r of store.rowRefs) {
-		if (hasCollapsedAncestor(store, r.id)) { r.tr.style.display = "none"; continue; }
 		const rk = `${r.groupKey}::${r.filePath}`;
-		if (store.collapsedGroups.has(r.groupKey) || store.collapsedFiles.has(rk)) r.tr.style.display = "none";
+		const hidden = hasCollapsedAncestor(store, r.id)
+			|| store.collapsedGroups.has(r.groupKey)
+			|| store.collapsedFiles.has(rk);
+		r.tr.style.display = hidden ? "none" : "";
 		styleAndWireNumber(store, r);
 	}
 	store.silentStylePass = false;
 
-	// focus pending
-	if (store.pendingFocusId) {
-		const ref = store.rowById.get(store.pendingFocusId);
-		store.pendingFocusId = null;
+	// Focus (clear pending before use to avoid loop)
+	const id = store.pendingFocusId;
+	store.pendingFocusId = null;
+	if (id) {
+		const ref = store.rowById.get(id);
 		if (ref) {
 			ref.previewCell.hide();
 			ref.textCell.show();
@@ -73,6 +84,11 @@ export async function mountTable(store: Store) {
 			ref.textCell.focus();
 		}
 	}
+
+	// Restore scroll position
+	queueMicrotask(() => {
+		if (scroller) scroller.scrollTop = prevScroll;
+	});
 }
 
 

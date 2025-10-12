@@ -1,16 +1,22 @@
 import {
 	App, Plugin, PluginSettingTab, Setting, WorkspaceLeaf
 } from "obsidian";
+import { TFile } from "obsidian";
 import { TaskTableView } from "./views/TaskTableView";
+import { compileRules } from "./data/scan";
+import { setIcon } from "obsidian";
+import { debounce } from "./utils/debounce";
 
 export const TASK_TABLE_VIEW_TYPE = "task-table-view";
 
 export interface TaskTableRule { name: string; re: string; }
 export interface MyPluginSettings {
 	regexRules: TaskTableRule[];
+	indexedPaths: string[];
 }
 const DEFAULT_SETTINGS: MyPluginSettings = {
 	regexRules: [{ name: "Planner", re: ".*/Planner/.*\\.md$" }],
+	indexedPaths: [],
 };
 
 export default class MyPlugin extends Plugin {
@@ -23,6 +29,9 @@ export default class MyPlugin extends Plugin {
 			new TaskTableView(leaf, {
 				settings: this.settings,
 				openSettings: () => this.openSettings(),
+				getIndexedFiles: () => this.getIndexedFiles(),
+				rescanIndex: () => this.rescanIndex(),
+
 			})
 		);
 
@@ -31,6 +40,38 @@ export default class MyPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new RulesSettingTab(this.app, this));
+
+		this.registerEvent(
+			this.app.workspace.on("active-leaf-change", async (leaf) => {
+				if (leaf?.view?.getViewType?.() === TASK_TABLE_VIEW_TYPE) {
+					await this.rescanIndex();
+					await this.notifySettingsChanged();
+				}
+			})
+		);
+	}
+
+	async rescanIndex(): Promise<number> {
+		const compiled = compileRules(this.settings.regexRules ?? []);
+		const all = this.app.vault.getMarkdownFiles();
+		// match via compiled regex rules
+		const matched = new Set<string>();
+		for (const f of all) {
+			const p = f.path;
+			if (compiled.some((c) => c.re.test(p))) matched.add(p);
+		}
+		this.settings.indexedPaths = Array.from(matched).sort((a, b) => a.localeCompare(b));
+		await this.saveSettings();
+		return this.settings.indexedPaths.length;
+	}
+
+	getIndexedFiles(): TFile[] {
+		const out: TFile[] = [];
+		for (const p of this.settings.indexedPaths ?? []) {
+			const af = this.app.vault.getAbstractFileByPath(p);
+			if (af instanceof TFile && af.extension === "md") out.push(af);
+		}
+		return out;
 	}
 
 	async activateView() {
@@ -85,8 +126,6 @@ class RulesSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-
-		// Minimal inline styles (scoped via a unique class)
 		containerEl.addClass("tt-rules");
 		let style = containerEl.querySelector("style[data-tt]") as HTMLStyleElement | null;
 		if (!style) {
@@ -127,6 +166,7 @@ class RulesSettingTab extends PluginSettingTab {
 				nameInput.oninput = async () => {
 					rule.name = nameInput.value;
 					await this.plugin.saveSettings();
+					rescanAndUpdate();
 				};
 
 				// Regex
@@ -136,6 +176,7 @@ class RulesSettingTab extends PluginSettingTab {
 				reInput.oninput = async () => {
 					rule.re = reInput.value;
 					await this.plugin.saveSettings();
+					rescanAndUpdate();
 				};
 
 				// Trash
@@ -144,11 +185,12 @@ class RulesSettingTab extends PluginSettingTab {
 					cls: "tt-icon-btn tt-trash",
 					attr: { "aria-label": "Delete rule", title: "Delete rule" },
 				});
-				delBtn.textContent = "🗑";
+				setIcon(delBtn, "trash-2");
 				delBtn.onclick = async () => {
 					this.plugin.settings.regexRules.splice(idx, 1);
 					await this.plugin.saveSettings();
 					render();
+					rescanAndUpdate();
 				};
 			});
 		};
@@ -157,9 +199,27 @@ class RulesSettingTab extends PluginSettingTab {
 			this.plugin.settings.regexRules.push({ name: "", re: "" });
 			await this.plugin.saveSettings();
 			render();
+			rescanAndUpdate();
 		};
 
 		render();
+
+		const countRow = containerEl.createDiv({ cls: "tt-scan-row" });
+		countRow.createSpan({ text: "Files: " });
+		const countSpan = countRow.createSpan({ cls: "tt-count" });
+
+		const setCountFromSettings = () => {
+			const n = this.plugin.settings.indexedPaths?.length ?? 0;
+			countSpan.setText(String(n));
+		};
+
+		const rescanAndUpdate = debounce(async () => {
+			await this.plugin.rescanIndex();
+			setCountFromSettings();
+		}, 100);
+
+		void this.plugin.rescanIndex().then(setCountFromSettings);
+
 	}
 
 	hide(): void {

@@ -1,6 +1,11 @@
-import { AppLike, UIRefs, RowRef, ScanResult } from "../types";
+import { AppLike, UIRefs, RowRef, ScanResult, TaskEntry } from "../types";
 import { MyPluginSettings } from "../main";
 import { updateStatusIcon } from "../ui/render"
+import type { TFile } from "obsidian";
+
+type Providers = {
+	getIndexedFiles: () => TFile[];
+};
 
 export class Store {
 	app: AppLike;
@@ -15,7 +20,7 @@ export class Store {
 	silentStylePass = false;
 
 	rowRefs: RowRef[] = [];
-	tasksByFile = new Map<string, any>();
+	tasksByFile = new Map<string, TaskEntry[]>();
 	childrenById = new Map<string, string[]>();
 	rowById = new Map<string, RowRef>();
 	collapsed = new Set<string>();
@@ -35,10 +40,13 @@ export class Store {
 
 	pendingFocusId: string | null = null;
 
-	constructor(app: AppLike, settings: MyPluginSettings, ui: UIRefs) {
+	providers: Providers;
+
+	constructor(app: AppLike, settings: MyPluginSettings, ui: UIRefs, providers: Providers) {
 		this.app = app;
 		this.settings = settings;
 		this.ui = ui;
+		this.providers = providers;
 	}
 
 	setSaving(on: boolean) {

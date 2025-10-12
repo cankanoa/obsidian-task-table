@@ -19,130 +19,191 @@ export const compileRules = (rules: { name: string; re: string }[]) =>
  * - Otherwise => group by rule.name; a file may appear under multiple groups if matched by different rules.
  *   (Within the same group, the file appears only once even if multiple rules with the same group name match.)
  */
-export async function scanTasks(app: App, compiled: CompiledRule[]): Promise<ScanResult> {
+
+// Accepts a pre-indexed list of files; does not discover new files.
+export async function scanTasks(
+	app: App,
+	compiled: CompiledRule[],
+	files: TFile[]
+): Promise<ScanResult> {
 	const tasksByFile = new Map<string, TaskEntry[]>();
 	const childrenById = new Map<string, string[]>();
-
-	if (!compiled.length) {
+	if (!compiled.length || files.length === 0)
 		return { groups: [], tasksByFile, childrenById, hasGroups: false };
-	}
 
 	const hasGroups = compiled.some((c) => (c.name ?? "").trim().length > 0);
-	const allMdFiles: TFile[] = app.vault.getMarkdownFiles();
-
-	// For grouped mode: Map<groupName, Map<filePath, FileBucket>>
 	const groupsMap = new Map<string, Map<string, FileBucket>>();
-	// For single-layer mode: Map<filePath, FileBucket>
 	const flatFiles = new Map<string, FileBucket>();
 
-	for (const file of allMdFiles) {
+	for (const file of files) {
 		const path = file.path;
-
-		// Determine which rules match this file
-		const matched = compiled.filter((c) => c.re.test(path));
+		const matched = getMatchedRules(path, compiled);
 		if (!matched.length) continue;
 
-		// Parse tasks for this file once
-		const content = await app.vault.read(file);
-		const lines = content.split("\n");
+		// Cached parse
+		const { entries: rawEntries, childrenById: localChildren } = await getCachedFileParse(app, file);
 
-		const rawEntries: TaskEntry[] = [];
-		let currentRootKey = "";
-		let currentRootToken = "";
-		let lastRootKey = "";
-		let lastRootToken = "";
-
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (!TASK_RX.test(line)) continue;
-
-			const depth = getIndentDepth(line);
-			const id = `${file.path}::${i}`;
-
-			if (depth === 1) {
-				currentRootKey = id;
-				currentRootToken = rootTokenFromLine(line);
-				lastRootKey = currentRootKey;
-				lastRootToken = currentRootToken;
-			} else {
-				if (!currentRootKey) currentRootKey = lastRootKey || `${file.path}::first`;
-				if (!currentRootToken) currentRootToken = lastRootToken || "untitled-root";
-			}
-
-			rawEntries.push({
-				file,
-				lineIndex: i,
-				originalLine: line,
-				depth,
-				rootKey: currentRootKey,
-				rootToken: currentRootToken,
-				id,
-			});
+		// Merge into global maps
+		if (rawEntries.length) tasksByFile.set(path, rawEntries);
+		for (const [pid, kids] of localChildren) {
+			if (!childrenById.has(pid)) childrenById.set(pid, []);
+			childrenById.get(pid)!.push(...kids);
 		}
 
-		// Parent links via stack
-		const stack: TaskEntry[] = [];
-		for (const e of rawEntries) {
-			while (stack.length && stack[stack.length - 1].depth >= e.depth) stack.pop();
-			e.parentId = stack.length ? stack[stack.length - 1].id : undefined;
-			stack.push(e);
-		}
-
-		// Children index
-		for (const e of rawEntries) {
-			if (!e.parentId) continue;
-			if (!childrenById.has(e.parentId)) childrenById.set(e.parentId, []);
-			childrenById.get(e.parentId)!.push(e.id);
-		}
-
-		if (rawEntries.length) tasksByFile.set(file.path, rawEntries);
-
-		// Fill output structures
-		const rawName = path.split("/").pop() ?? path;
-		const fileName = rawName.replace(/\.md$/i, "");
-
-		if (!hasGroups) {
-			// Single-layer: every matched file shows once total
-			if (!flatFiles.has(path)) {
-				flatFiles.set(path, { filePath: path, fileName, items: rawEntries });
-			}
-		} else {
-			// Grouped: add once per matched non-empty group name
-			const groupNames = Array.from(
-				new Set(
-					matched
-						.map((m) => (m.name ?? "").trim())
-						.filter((n) => n.length > 0)
-				)
-			);
-
-			for (const gName of groupNames) {
-				if (!groupsMap.has(gName)) groupsMap.set(gName, new Map<string, FileBucket>());
-				const filesMap = groupsMap.get(gName)!;
-				// Important: within a group, add this file only once
-				if (!filesMap.has(path)) {
-					filesMap.set(path, { filePath: path, fileName, items: rawEntries });
-				}
-			}
-		}
+		// Grouping
+		const fileName = extractFileName(path);
+		addFileToGroups(path, fileName, rawEntries, matched, hasGroups, flatFiles, groupsMap);
 	}
 
-	let groups: GroupBucket[] = [];
+	const groups = buildGroupBuckets(hasGroups, flatFiles, groupsMap);
+	return { groups, tasksByFile, childrenById, hasGroups };
+}
+
+async function getCachedFileParse(app: App, file: TFile): Promise<{ entries: TaskEntry[]; childrenById: Map<string, string[]> }> {
+	const path = file.path;
+	const mtime = file.stat?.mtime ?? 0;
+	const cached = TASK_PARSE_CACHE.get(path);
+
+	if (cached && cached.mtime === mtime) {
+		return { entries: cached.entries, childrenById: cached.childrenById };
+	}
+
+	const lines = (await app.vault.read(file)).split("\n");
+	const entries: TaskEntry[] = [];
+	const childrenById = new Map<string, string[]>();
+	let currentRootKey = "", currentRootToken = "", lastRootKey = "", lastRootToken = "";
+
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (!TASK_RX.test(line)) continue;
+		const depth = getIndentDepth(line);
+		const id = `${path}::${i}`;
+
+		if (depth === 1) {
+			currentRootKey = id;
+			currentRootToken = rootTokenFromLine(line);
+			lastRootKey = currentRootKey;
+			lastRootToken = currentRootToken;
+		} else {
+			if (!currentRootKey) currentRootKey = lastRootKey || `${path}::first`;
+			if (!currentRootToken) currentRootToken = lastRootToken || "untitled-root";
+		}
+
+		entries.push({
+			file, lineIndex: i, originalLine: line, depth,
+			rootKey: currentRootKey, rootToken: currentRootToken, id,
+		});
+	}
+
+	const stack: TaskEntry[] = [];
+	for (const e of entries) {
+		while (stack.length && stack[stack.length - 1].depth >= e.depth) stack.pop();
+		e.parentId = stack.length ? stack[stack.length - 1].id : undefined;
+		stack.push(e);
+	}
+
+	for (const e of entries) {
+		if (!e.parentId) continue;
+		if (!childrenById.has(e.parentId)) childrenById.set(e.parentId, []);
+		childrenById.get(e.parentId)!.push(e.id);
+	}
+
+	TASK_PARSE_CACHE.set(path, { mtime, entries, childrenById });
+	return { entries, childrenById };
+}
+
+/** Clear cached parse for one file (optional external use). */
+export function invalidateCachedFile(path: string) {
+	TASK_PARSE_CACHE.delete(path);
+}
+
+
+function getMatchedRules(path: string, compiled: CompiledRule[]): CompiledRule[] {
+	return compiled.filter((c) => c.re.test(path));
+}
+
+function extractFileName(path: string): string {
+	return (path.split("/").pop() ?? path).replace(/\.md$/i, "");
+}
+
+
+
+type CachedParse = {
+	mtime: number;
+	entries: TaskEntry[];
+	// children index for this file only
+	childrenById: Map<string, string[]>;
+};
+const TASK_PARSE_CACHE = new Map<string, CachedParse>();
+
+/** Builds parent/child relationships in a list of TaskEntry objects. */
+function buildParentChildLinks(entries: TaskEntry[]): Map<string, string[]> {
+	const childrenById = new Map<string, string[]>();
+	const stack: TaskEntry[] = [];
+
+	for (const e of entries) {
+		while (stack.length && stack[stack.length - 1].depth >= e.depth) stack.pop();
+		e.parentId = stack.length ? stack[stack.length - 1].id : undefined;
+		stack.push(e);
+	}
+
+	for (const e of entries) {
+		if (!e.parentId) continue;
+		if (!childrenById.has(e.parentId)) childrenById.set(e.parentId, []);
+		childrenById.get(e.parentId)!.push(e.id);
+	}
+
+	return childrenById;
+}
+
+/** Groups a parsed file into either flat or named group buckets. */
+function addFileToGroups(
+	path: string,
+	fileName: string,
+	rawEntries: TaskEntry[],
+	matched: CompiledRule[],
+	hasGroups: boolean,
+	flatFiles: Map<string, FileBucket>,
+	groupsMap: Map<string, Map<string, FileBucket>>
+) {
+	if (!rawEntries.length) return;
 
 	if (!hasGroups) {
-		// Single-layer: produce a single pseudo-group that the UI will render without a group header
-		const filesArr = Array.from(flatFiles.values()).sort((a, b) => a.fileName.localeCompare(b.fileName));
-		groups = [{ key: "__ALL__", name: "", files: filesArr }];
+		if (!flatFiles.has(path))
+			flatFiles.set(path, { filePath: path, fileName, items: rawEntries });
 	} else {
-		// Grouped: deterministic order by group name, then file name
-		const groupNames = Array.from(groupsMap.keys()).sort((a, b) => a.localeCompare(b));
+		const groupNames = Array.from(
+			new Set(matched.map((m) => (m.name ?? "").trim()).filter(Boolean))
+		);
 		for (const gName of groupNames) {
-			const filesArr = Array.from(groupsMap.get(gName)!.values()).sort((a, b) =>
-				a.fileName.localeCompare(b.fileName)
-			);
-			groups.push({ key: gName, name: gName, files: filesArr });
+			if (!groupsMap.has(gName)) groupsMap.set(gName, new Map<string, FileBucket>());
+			const filesMap = groupsMap.get(gName)!;
+			if (!filesMap.has(path))
+				filesMap.set(path, { filePath: path, fileName, items: rawEntries });
 		}
 	}
+}
 
-	return { groups, tasksByFile, childrenById, hasGroups };
+/** Converts file/group maps into final GroupBucket[] for output. */
+function buildGroupBuckets(
+	hasGroups: boolean,
+	flatFiles: Map<string, FileBucket>,
+	groupsMap: Map<string, Map<string, FileBucket>>
+): GroupBucket[] {
+	if (!hasGroups) {
+		const filesArr = Array.from(flatFiles.values()).sort((a, b) =>
+			a.fileName.localeCompare(b.fileName)
+		);
+		return [{ key: "__ALL__", name: "", files: filesArr }];
+	}
+
+	const names = Array.from(groupsMap.keys()).sort((a, b) => a.localeCompare(b));
+	const groups: GroupBucket[] = [];
+	for (const gName of names) {
+		const filesArr = Array.from(groupsMap.get(gName)!.values()).sort((a, b) =>
+			a.fileName.localeCompare(b.fileName)
+		);
+		groups.push({ key: gName, name: gName, files: filesArr });
+	}
+	return groups;
 }

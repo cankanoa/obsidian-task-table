@@ -5,16 +5,25 @@ import { createScaffold } from "../ui/scaffold";
 import { mountTable } from "../ui/render";
 import { wireAutoscan } from "../ui/autoscan";
 import { Store } from "../state/store";
+import type { TFile } from "obsidian";
+
+type PluginAPI = {
+	settings: MyPluginSettings;
+	openSettings: () => void;
+	getIndexedFiles: () => TFile[];
+	rescanIndex: () => Promise<number>;
+};
 
 export class TaskTableView extends ItemView {
-	private plugin: { settings: MyPluginSettings; openSettings: () => void };
+	private plugin: PluginAPI;
 	private store: Store | null = null;
 	private disposeAutoscan: (() => void) | null = null;
 
-	constructor(leaf: WorkspaceLeaf, plugin: { settings: MyPluginSettings; openSettings: () => void }) {
+	constructor(leaf: WorkspaceLeaf, plugin: PluginAPI) {
 		super(leaf);
 		this.plugin = plugin;
 	}
+
 
 	getViewType() { return TASK_TABLE_VIEW_TYPE; }
 	getDisplayText() { return "Task Table"; }
@@ -26,20 +35,24 @@ export class TaskTableView extends ItemView {
 		createStyles(this);
 		const ui = createScaffold(container, { onOpenSettings: this.plugin.openSettings });
 
-		this.store = new Store(this.app, this.plugin.settings, ui);
+		// Pass providers object into Store
+		this.store = new Store(this.app, this.plugin.settings, ui, {
+			getIndexedFiles: this.plugin.getIndexedFiles,
+		});
+
+		// Discover new files only now (view open)
+		await this.plugin.rescanIndex();
+
+		// Mount using cached index via store.providers
 		await mountTable(this.store);
 
-		this.disposeAutoscan = wireAutoscan(
-			this.app,
-			this.store,   // ← pass the store
-			async () => {
-				if (!this.store) return;
-				await mountTable(this.store);
-			}
-		);
+		// Autoscan: just refresh the table using cached files
+		this.disposeAutoscan = wireAutoscan(this.app, this.store, async () => {
+			if (!this.store) return;
+			await mountTable(this.store);
+		});
 	}
 
-	// Allow plugin to re-render after settings close
 	async refresh() {
 		if (!this.store) return;
 		this.store.settings = this.plugin.settings;

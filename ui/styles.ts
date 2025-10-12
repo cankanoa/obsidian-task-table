@@ -15,8 +15,17 @@ export function createStyles(view: ItemView) {
 .task-new .placeholder { color: var(--text-muted); }
 .task-new .plus { display:inline-flex; align-items:center; justify-content:center;
   width:1.5em; min-width:1.5em; height:1.5em; border-radius:4px; font-weight:700; opacity:0.7; user-select:none; }
-.row-wrap { display:flex; align-items:flex-start; gap:6px; min-width:0; }
-.row-wrap .num, .row-wrap input[type="checkbox"] { margin-top: 2px; }
+
+/* Center everything vertically in the left row */
+.row-wrap { display:flex; align-items:center; gap:6px; min-width:0; }
+
+/* Remove the vertical nudge that was pushing things down */
+.row-wrap .num,
+.row-wrap input[type="checkbox"] { margin-top: 0; }
+
+/* (Optional) ensure checkbox lines up nicely across themes */
+.row-wrap input[type="checkbox"] { vertical-align: middle; }
+
 .task-edit, .task-preview { font-size: var(--font-ui-medium, 14px); line-height: 1.4; }
 `;
 	document.head.appendChild(style);

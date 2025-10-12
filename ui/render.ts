@@ -1,9 +1,8 @@
-import { MarkdownRenderer, Notice, Component } from "obsidian";
+import {MarkdownRenderer, Notice, Component, setIcon} from "obsidian";
 import { Store } from "../state/store";
 import { compileRules, scanTasks } from "../data/scan";
 import { GroupBucket, RowRef, TaskEntry } from "../types";
-import { debounce } from "../utils/debounce";
-import { buildLine, getIndentDepth, hsl, TASK_RX } from "../utils/text";
+import { buildLine, hsl } from "../utils/text";
 import * as Move from "../io/move";
 import * as Save from "../io/save";
 
@@ -12,14 +11,15 @@ export async function mountTable(store: Store) {
 	const prevScroll = scroller?.scrollTop ?? 0;
 
 	const compiled = compileRules(store.settings.regexRules ?? []);
-	const result = await scanTasks(store.app, compiled);
+	const files = store.providers.getIndexedFiles();
+
+	const result = await scanTasks(store.app, compiled, files);
 	store.applyScan(result);
 
 	// Clear table
 	for (const r of store.rowRefs) r.mdComp?.unload?.();
 	store.resetTableMaps();
 	store.ui.tbody.empty();
-
 	updateStatusIcon(store);
 
 	// Rebuild table content
@@ -413,9 +413,29 @@ export function addTaskRow(store: Store, entry: TaskEntry, hasChildren: boolean,
 
 	const numEl = leftWrap.createSpan({ text: String(depth) }); numEl.classList.add("num");
 
-	const cb = leftWrap.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
-	cb.checked = checked; cb.style.flex = "0 0 auto";
+	const ctrls = leftWrap.createDiv({ cls: "tt-ctrls" });
+	ctrls.style.cssText = "display:inline-flex;align-items:center;gap:6px;";
 
+	const cb = ctrls.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement;
+	cb.checked = checked;
+	cb.style.flex = "0 0 auto";
+
+// delete button lives next to the checkbox
+	const delBtn = ctrls.createEl("button", {
+		attr: { title: "Delete task & subtasks", "aria-label": "Delete task" },
+	});
+	setIcon(delBtn, "trash-2");
+	Object.assign(delBtn.style, {
+		display: "inline-flex",
+		alignItems: "center",
+		justifyContent: "center",
+		padding: "0 6px",
+		height: "1.5em",
+		lineHeight: "1",
+		border: "none",
+		background: "transparent",
+		cursor: "pointer",
+	});
 	const textWrap = leftWrap.createDiv();
 	Object.assign(textWrap.style, { flex: "1 1 auto", minWidth: "0", position: "relative", wordBreak: "break-word" });
 
@@ -443,10 +463,6 @@ export function addTaskRow(store: Store, entry: TaskEntry, hasChildren: boolean,
 		if (editor?.setCursor) editor.setCursor({ line: lineIndex, ch: 0 });
 	};
 
-	const delBtn = tdRight.createEl("button", { title: "Delete task & subtasks" });
-	delBtn.textContent = "🗑"; delBtn.style.fontSize = "14px"; delBtn.style.lineHeight = "1";
-	delBtn.style.padding = "4px 8px"; delBtn.style.marginLeft = "6px";
-
 	const mdComp = new Component();
 	(store as any).addChild?.(mdComp);
 
@@ -458,24 +474,16 @@ export function addTaskRow(store: Store, entry: TaskEntry, hasChildren: boolean,
 
 	renderMarkdown(store, rowRef).then(() => updateRowLayout(rowRef, text));
 
-	preview.addEventListener("click", () => {
-		preview.hide(); editable.show();
-		const sel = window.getSelection(); const range = document.createRange();
-		range.selectNodeContents(editable); range.collapse(false);
-		sel?.removeAllRanges(); sel?.addRange(range); editable.focus();
+	preview.addEventListener("click", () => { preview.hide(); editable.show(); editable.focus(); });
+	editable.addEventListener("blur", async () => {
+		preview.show(); editable.hide();
+		await renderMarkdown(store, rowRef);
 	});
-
-	const debouncedLive = debounce(() => renderMarkdown(store, rowRef), 200);
 
 	editable.addEventListener("input", () => {
 		store.markDirty();
 		updateRowLayout(rowRef, editable.textContent ?? "");
-		debouncedLive();
 		Save.scheduleAutosave(store);
-	});
-	editable.addEventListener("blur", () => {
-		preview.show(); editable.hide();
-		renderMarkdown(store, rowRef);
 	});
 
 	cb.onchange = async () => {

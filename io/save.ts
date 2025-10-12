@@ -1,9 +1,8 @@
 import { Store } from "../state/store";
 import { buildLine } from "../utils/text";
 import { mountTable } from "../ui/render";
-import { MarkdownRenderer, Component } from "obsidian";
+import { invalidateCachedFile } from "../data/scan";
 
-// WeakMap so the Store can be GC’d when the view closes
 const autosaveDebounced: WeakMap<Store, number> = new WeakMap();
 
 export function scheduleAutosave(store: Store) {
@@ -48,15 +47,13 @@ export async function saveEdits(store: Store) {
 					}
 				}
 				await store.app.vault.modify(file, lines.join("\n"));
+				invalidateCachedFile(file.path);
 			}
 		});
 		for (const ref of store.rowRefs) {
 			const text = (ref.textCell.textContent ?? "").trim();
 			ref.originalLine = buildLine(ref.originalLine, ref.checkbox.checked, text);
 
-			if ((ref.previewCell as any)?.isShown?.()) {
-				await renderWithObsidian(store, ref, text);
-			}
 		}
 		store.markCleanIf(versionAtStart);
 	} catch (e) {
@@ -64,25 +61,6 @@ export async function saveEdits(store: Store) {
 	} finally {
 		store.setSaving(false);
 	}
-}
-
-async function renderWithObsidian(store: Store, ref: any, markdown: string) {
-	// Clean previous render/component
-	(ref as any).__mdComp?.unload?.();
-	ref.previewCell.empty();
-
-	// Create a lifecycle component for this render
-	const comp = new Component();
-	(ref as any).__mdComp = comp;
-
-	// Render plain task text as markdown in the preview cell
-	await MarkdownRenderer.render(
-		store.app as any,
-		markdown ?? "",
-		ref.previewCell,
-		ref.filePath,
-		comp
-	);
 }
 
 export async function saveRowImmediate(store: Store, args: {
@@ -106,6 +84,7 @@ export async function saveRowImmediate(store: Store, args: {
 			if (lines[lineIndex] === newLine) return;
 			lines[lineIndex] = newLine;
 			await store.app.vault.modify(file, lines.join("\n"));
+			invalidateCachedFile(file.path);
 		});
 	} finally {
 		store.setSaving(false);
@@ -134,6 +113,7 @@ export async function createNewTaskAtEnd(store: Store, filePath: string, text: s
 			lines.splice(insertAt, 0, newLine);
 			const out = lines.join("\n");
 			await store.app.vault.modify(file, out.endsWith("\n") ? out : out + "\n");
+			invalidateCachedFile(file.path);
 
 			// focus the newly created item after remount
 			store.pendingFocusId = `${filePath}::${insertAt}`;

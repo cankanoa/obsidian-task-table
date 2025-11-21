@@ -1,30 +1,40 @@
-# Obsidian Sample Plugin
+# Obsidian Task Table
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+A lightweight task-aggregation view for Obsidian. This plugin collects tasks from notes that match user-defined regex rules and displays them in a clean, flat table while retaining each task’s position in the hierarchy through numbering. Task Table is designed for users who maintain structured notes (e.g., Planner folders, project files, grouped outlines) and want a unified task view without losing context.
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+## Usage
+Click the convenient ribbon icon to open the view. This will open the main table to show bullet points. The table preserves hierarchy by using numeric prefixes to indicate the depth of the task. The numbers can be dragged to rearrange the table and clicked to expand/contract the task. The checkbox is simple there for marking tasks as complete. The trash icon can be used to delete tasks. Tasks are directly editable in the table which automatically updates the corresponding note.
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open Sample Modal" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and output 'click' to the console.
-- Registers a global interval which logs 'setInterval' to the console.
+The settings page allows the user to define the regex rules for the notes to be auto-scanned to include in the table. They can be defined like this:  `.*/Planner/.*\\.md$`, which will match all notes in the `Planner` folder. Each note file will become its own list (with the file name as the header), and an optional grouping for all files that match that regex rule (mulitple rules can be defined). This allows for either one or two levels of headings.
 
-## First time developing plugins?
+![ui_view.png](images/ui_view.png)
 
-Quick starting guide for new plugin devs:
+## Installation
 
-- Check if [someone already developed a plugin for what you want](https://obsidian.md/plugins)! There might be an existing plugin similar enough that you can partner up with.
-- Make a copy of this repo as a template with the "Use this template" button (login to GitHub if you don't see it).
-- Clone your repo to a local development folder. For convenience, you can place this folder in your `.obsidian/plugins/your-plugin-name` folder.
-- Install NodeJS, then run `npm i` in the command line under your repo folder.
-- Run `npm run dev` to compile your plugin from `main.ts` to `main.js`.
-- Make changes to `main.ts` (or create new `.ts` files). Those changes should be automatically compiled into `main.js`.
-- Reload Obsidian to load the new version of your plugin.
-- Enable plugin in settings window.
-- For updates to the Obsidian API run `npm update` in the command line under your repo folder.
+### Via Community Plugin
+1. [Download](https://obsidian.md/download) and install Obsidian
+2. Go to: Settings > Community Plugins > Browse
+3. Search for and enable `Task Table`
+
+### Manually
+1. Create an obsidian vault folder and navigate into the plugin folder
+2. Clone the Tasks Table GitHub repository into an obsidian vault plugin folder:
+```bash
+git clone https://github.com/cankanoa/obsidian-task-table.git
+```
+3. Make sure your NodeJS is at least v16: `node --version`
+4. `npm i` or `yarn` to install dependencies
+5. `npm run dev` to start compilation in watch mode
+6. Reload Obsidian (View > Force Reload) to see changes
+
+## Todo
+- [ ] Add a slider (or dots) for auto-expanding all rows in the table view
+- [ ] Add other columns for metadata
+- [ ] Filter by tags
+- [ ] New bullet when click return at the end of the task
+- [ ] More efficient auto update task rows
+- [ ] Headers still show up if there are no tasks in the file
+- [ ] Select with type of bullets to include in settings
 
 ## Releasing new releases
 
@@ -37,25 +47,7 @@ Quick starting guide for new plugin devs:
 > You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
 > The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
 
-## Adding your plugin to the community plugin list
-
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
-
-## How to use
-
-- Clone this repo.
-- Make sure your NodeJS is at least v16 (`node --version`).
-- `npm i` or `yarn` to install dependencies.
-- `npm run dev` to start compilation in watch mode.
-
-## Manually installing the plugin
-
-- Copy over `main.js`, `styles.css`, `manifest.json` to your vault `VaultFolder/.obsidian/plugins/your-plugin-id/`.
-
-## Improve code quality with eslint (optional)
+## Code Formatting With eslint
 - [ESLint](https://eslint.org/) is a tool that analyzes your code to quickly find problems. You can run ESLint against your plugin to find common bugs and ways to improve your code. 
 - To use eslint with this project, make sure to install eslint from terminal:
   - `npm install -g eslint`
@@ -65,30 +57,5 @@ Quick starting guide for new plugin devs:
 - If your source code is in a folder, such as `src`, you can use eslint with this command to analyze all files in that folder:
   - `eslint .\src\`
 
-## Funding URL
-
-You can include funding URLs where people who use your plugin can financially support it.
-
-The simple way is to set the `fundingUrl` field to your link in your `manifest.json` file:
-
-```json
-{
-    "fundingUrl": "https://buymeacoffee.com"
-}
-```
-
-If you have multiple URLs, you can also do:
-
-```json
-{
-    "fundingUrl": {
-        "Buy Me a Coffee": "https://buymeacoffee.com",
-        "GitHub Sponsor": "https://github.com/sponsors",
-        "Patreon": "https://www.patreon.com/"
-    }
-}
-```
-
-## API Documentation
-
-See https://github.com/obsidianmd/obsidian-api
+## Credit
+This plugin was created by [Kanoa Lindiwe](https://kanoalindiwe.com) and is owned by Kanoa Lindiwe LLC.

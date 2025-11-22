@@ -1,0 +1,76 @@
+name: Release Obsidian Plugin Version
+
+on:
+    push:
+        tags:
+            - '*.*.*'
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Optional version tag (ex: '1.2.3')"
+                required: false
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+
+        steps:
+            - name: Checkout repo
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+                  ref: ${{ github.event.inputs.version || github.ref_name }}
+
+            - name: Read manifest.json version
+              id: manifest
+              run: |
+                  VERSION=$(jq -r '.version' manifest.json)
+                  echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+            - name: Verify tag matches manifest.json
+              run: |
+                  TAG="${{ github.event.inputs.version || github.ref_name }}"
+                  MANIFEST="${{ steps.manifest.outputs.version }}"
+                  
+                  echo "Tag: $TAG"
+                  echo "Manifest: $MANIFEST"
+                  
+                  if [ "$TAG" != "$MANIFEST" ]; then
+                    echo "Tag does not match manifest.json version"
+                    exit 1
+                  fi
+
+            - name: Install Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Build plugin
+              run: npm run build
+
+            - name: Create ZIP for release
+              run: |
+                  mkdir release
+                  cp main.js manifest.json release/
+                  if [ -f styles.css ]; then cp styles.css release/; fi
+                  cd release
+                  zip -r ../plugin-${{ steps.manifest.outputs.version }}.zip .
+
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v1
+              with:
+                  tag_name: ${{ github.event.inputs.version || github.ref_name }}
+                  name: "Release ${{ steps.manifest.outputs.version }}"
+                  body: Automated release for version ${{ steps.manifest.outputs.version }}.
+                  files: |
+                      plugin-${{ steps.manifest.outputs.version }}.zip
+                      main.js
+                      manifest.json
+                      styles.css
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

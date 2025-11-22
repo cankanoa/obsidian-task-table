@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-sample-plugin",
-	"version": "0.0.0",
+	"version": "1.0.0",
 	"description": "Vault-wide table display of tasks from filtered notes.",
 	"main": "main.js",
 	"scripts": {

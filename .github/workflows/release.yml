@@ -59,7 +59,7 @@ jobs:
                   cp main.js manifest.json release/
                   if [ -f styles.css ]; then cp styles.css release/; fi
                   cd release
-                  zip -r ../plugin-${{ steps.manifest.outputs.version }}.zip .
+                  zip -r ../task-table-obsidian-plugin-${{ steps.manifest.outputs.version }}.zip .
 
             - name: Create GitHub Release
               uses: softprops/action-gh-release@v1
@@ -68,7 +68,7 @@ jobs:
                   name: "Release ${{ steps.manifest.outputs.version }}"
                   body: Automated release for version ${{ steps.manifest.outputs.version }}.
                   files: |
-                      plugin-${{ steps.manifest.outputs.version }}.zip
+                      task-table-obsidian-plugin-${{ steps.manifest.outputs.version }}.zip
                       main.js
                       manifest.json
                       styles.css

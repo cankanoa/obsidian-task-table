@@ -1,9 +1,9 @@
 {
 	"id": "task-table",
 	"name": "Task Table",
-	"version": "1.0.0",
+	"version": "0.0.0",
 	"minAppVersion": "1.8.0",
-	"description": "Vault-wide table display of tasks from filtered notes",
+	"description": "Vault-wide table display of tasks from filtered notes.",
 	"author": "Kanoa Lindiwe LLC",
 	"authorUrl": "https://kanoalindiwe.com",
 	"fundingUrl": "https://www.paypal.com/donate/?hosted_button_id=VGBB9QURT7XEU",
